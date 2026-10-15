@@ -1,0 +1,16 @@
+# Copyright 2026 Internet Mastering & Company, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+private_key = "REPLACE_WITH_CLIENT_PRIVATE_KEY"
+
+peer_public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY"
+
+endpoint = "203.0.113.20:51820"
+
+address = "10.50.0.2"
+gateway = "10.50.0.1"
+prefix_len = 24
+
+socks_listen = "127.0.0.1:1080"
+
+persistent_keepalive = 25

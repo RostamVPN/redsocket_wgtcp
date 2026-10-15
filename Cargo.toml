@@ -1,0 +1,36 @@
+[package]
+name = "redsocket-wgtcp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+blake2 = "0.10.6"
+boringtun = "0.7"
+clap = { version = "4.6.6", features = ["derive"] }
+env_logger = "0.11.11"
+futures = "0.3.33"
+hex = "0.4.3"
+log = "0.4.33"
+rand = "0.10.2"
+getrandom = "0.4"
+serde = { version = "1.0.229", features = ["derive"] }
+smoltcp = "0.13"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.20"
+tokio = { version = "1", features = ["full"] }
+toml = "1.1.4"
+tun = { version = "0.8", features = ["async"] }
+[[bin]]
+name = "redsocket-wgtcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "redsocket-wgtcp-server"
+path = "src/bin/server.rs"
+
+[lib]
+name = "redsocket_wgtcp"
+path = "src/lib.rs"

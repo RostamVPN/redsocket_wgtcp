@@ -1,0 +1,10 @@
+{"mode": "userspace", "clients_up": 1, "streams_total": 4, "mbit_s": 1745.1, "mb_s": 208.04, "system_busy_pct": 64.2, "server_proc_cpu_pct_one_core": 70.2, "cores": 4, "seconds": 20.0}
+{"mode": "kernel", "clients_up": 1, "streams_total": 4, "mbit_s": 1206.3, "mb_s": 143.8, "system_busy_pct": 70.4, "server_proc_cpu_pct_one_core": null, "cores": 4, "seconds": 20.0}
+{"mode": "userspace", "clients_up": 2, "streams_total": 8, "mbit_s": 2128.6, "mb_s": 253.75, "system_busy_pct": 75.0, "server_proc_cpu_pct_one_core": 90.5, "cores": 4, "seconds": 20.0}
+{"mode": "kernel", "clients_up": 2, "streams_total": 8, "mbit_s": 1611.7, "mb_s": 192.12, "system_busy_pct": 82.3, "server_proc_cpu_pct_one_core": null, "cores": 4, "seconds": 20.0}
+{"mode": "userspace", "clients_up": 3, "streams_total": 12, "mbit_s": 2010.3, "mb_s": 239.65, "system_busy_pct": 75.4, "server_proc_cpu_pct_one_core": 92.0, "cores": 4, "seconds": 20.0}
+{"mode": "kernel", "clients_up": 3, "streams_total": 12, "mbit_s": 1808.0, "mb_s": 215.54, "system_busy_pct": 92.9, "server_proc_cpu_pct_one_core": null, "cores": 4, "seconds": 20.0}
+{"mode": "userspace", "clients_up": 7, "streams_total": 28, "mbit_s": 1878.2, "mb_s": 223.9, "system_busy_pct": 75.7, "server_proc_cpu_pct_one_core": 96.7, "cores": 4, "seconds": 20.0}
+{"mode": "kernel", "clients_up": 7, "streams_total": 28, "mbit_s": 1859.3, "mb_s": 221.65, "system_busy_pct": 93.0, "server_proc_cpu_pct_one_core": null, "cores": 4, "seconds": 20.0}
+{"mode": "userspace", "clients_up": 13, "streams_total": 52, "mbit_s": 1822.0, "mb_s": 217.2, "system_busy_pct": 76.1, "server_proc_cpu_pct_one_core": 97.4, "cores": 4, "seconds": 20.0}
+{"mode": "kernel", "clients_up": 16, "streams_total": 64, "mbit_s": 1614.3, "mb_s": 192.44, "system_busy_pct": 86.0, "server_proc_cpu_pct_one_core": null, "cores": 4, "seconds": 20.0}

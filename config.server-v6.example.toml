@@ -1,0 +1,21 @@
+# Copyright 2026 Internet Mastering & Company, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+address     = "10.60.0.1"
+prefix_len  = 24
+tun_name    = "wgs0"
+mtu         = 1380
+
+v6_prefix     = "fd00:5ed0:c0de::"
+v6_prefix_len = 48
+
+[[listen]]
+address   = "0.0.0.0:8443"
+transport = "tcp"
+
+[[listen]]
+address   = "0.0.0.0:8445"
+transport = "udp"
+
+[[peers]]
+public_key = "JrsrDrD66jNExfafQg53m/U5QEK7GzxSI1xmLRm0JWQ="

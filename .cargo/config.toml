@@ -1,0 +1,11 @@
+[build]
+rustflags = ["--remap-path-prefix", "/Users=/build", "--remap-path-prefix", "/home=/build"]
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+
+[env]
+CFLAGS = "-ffile-prefix-map=/Users=/build -ffile-prefix-map=/home=/build"

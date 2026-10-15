@@ -1,0 +1,9 @@
+/target
+
+# Never commit real configs; they carry private keys.
+/config.toml
+/*.local.toml
+
+!**/vendor/**
+!**/vendor/**/target/
+!**/.cargo/
