@@ -78,12 +78,15 @@ pub async fn run_tunnel(
     Ok(())
 }
 
-/// Generate a WireGuard keypair.
+/// Generate a WireGuard keypair; the private key is clamped like `wg genkey` output.
 pub fn generate_keypair() -> (String, String) {
     use base64::Engine;
 
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("OS randomness unavailable");
+    seed[0] &= 248;
+    seed[31] &= 127;
+    seed[31] |= 64;
     let secret = boringtun::x25519::StaticSecret::from(seed);
     let public = boringtun::x25519::PublicKey::from(&secret);
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -137,6 +140,8 @@ mod keygen_tests {
 
         let mut sk = [0u8; 32];
         sk.copy_from_slice(&b64.decode(&priv1).unwrap());
+        assert_eq!(sk[0] & 7, 0, "private key must be clamped like wg genkey");
+        assert_eq!(sk[31] & 0xC0, 0x40, "private key must be clamped like wg genkey");
         let derived = boringtun::x25519::PublicKey::from(&boringtun::x25519::StaticSecret::from(sk));
         assert_eq!(b64.encode(derived.as_bytes()), pub1, "public key does not match private");
 

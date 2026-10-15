@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use rand::Rng;
 use std::path::PathBuf;
 
 use redsocket_wgtcp::config::Config;
@@ -56,16 +55,9 @@ async fn main() -> Result<()> {
 }
 
 fn genkey() -> Result<()> {
-    let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
-
-    key[0] &= 248;
-    key[31] &= 127;
-    key[31] |= 64;
-
-    let public = WgPeer::public_key(&key);
-    println!("private: {}", wg::key_to_base64(&key));
-    println!("public:  {}", wg::key_to_base64(&public));
+    let (private, public) = redsocket_wgtcp::generate_keypair();
+    println!("private: {private}");
+    println!("public:  {public}");
     Ok(())
 }
 
