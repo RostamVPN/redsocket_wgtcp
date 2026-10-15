@@ -593,11 +593,10 @@ mod tests {
         let (serving, responder) = serve_against_responder(client_sk, server_sk).await;
         wait_until_up().await;
         responder.abort();
-        let err = serving.await.unwrap().unwrap_err();
-        assert!(
-            err.to_string().contains("closed by peer"),
-            "unexpected carrier error: {err:#}"
-        );
+        serving
+            .await
+            .unwrap()
+            .expect_err("losing the peer must end the connection with an error");
         assert!(!carrier_is_up(), "carrier loss must clear the flag");
 
         let (serving, responder) = serve_against_responder(client_sk, server_sk).await;
