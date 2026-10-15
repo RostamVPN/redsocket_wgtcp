@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
 use smoltcp::iface::SocketHandle;
@@ -31,6 +32,11 @@ const POLL_TICK: Duration = Duration::from_millis(10);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Deadline for one carrier write. A peer that holds the connection open but
+/// stops reading is treated as lost once this elapses; the event loop pauses for
+/// at most this long before the carrier is dropped and reconnected.
+const WRITE_DEADLINE: Duration = Duration::from_secs(50);
 
 /// A request from a SOCKS5 connection to open a tunneled stream.
 pub struct ConnectRequest {
@@ -141,7 +147,9 @@ impl Carrier {
         let init = self.peer.initiate_handshake()?;
         let mut out = Vec::new();
         record::encode(&init, &mut out)?;
-        wr.write_all(&out).await.context("write handshake")?;
+        write_within(&mut wr, &out, WRITE_DEADLINE)
+            .await
+            .context("write handshake")?;
 
         let mut read_buf = vec![0u8; 65536];
         let mut timer = tokio::time::interval(TIMER_TICK);
@@ -218,7 +226,9 @@ impl Carrier {
                     }
                 }
 
-                wr.write_all(&batch).await.context("carrier write")?;
+                write_within(&mut wr, &batch, WRITE_DEADLINE)
+                    .await
+                    .context("carrier write")?;
             }
 
             self.reap_streams();
@@ -336,6 +346,14 @@ impl Carrier {
             }
         }
     }
+}
+
+/// Write to the carrier, failing when the peer does not drain it within `deadline`.
+async fn write_within(wr: &mut OwnedWriteHalf, data: &[u8], deadline: Duration) -> Result<()> {
+    tokio::time::timeout(deadline, wr.write_all(data))
+        .await
+        .map_err(|_| anyhow!("peer stopped reading for {deadline:?}"))?
+        .map_err(Into::into)
 }
 
 /// Whether a WireGuard handshake has completed on the current carrier connection.
@@ -540,6 +558,36 @@ mod tests {
             "unexpected carrier error: {err:#}"
         );
         assert!(!carrier_is_up(), "carrier loss must clear the flag");
+    }
+
+    /// A peer that keeps the connection open but stops reading must not stall the
+    /// carrier forever: the write gives up at the deadline so the carrier is
+    /// declared lost and reconnected.
+    #[tokio::test]
+    async fn write_gives_up_when_the_peer_stops_reading() {
+        let listener =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        listener.set_recv_buffer_size(4096).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        listener.bind(&any.into()).unwrap();
+        listener.listen(1).unwrap();
+        let listener = TcpListener::from_std(listener.into()).unwrap();
+
+        let sock = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_held, _) = listener.accept().await.unwrap();
+        let (_rd, mut wr) = sock.into_split();
+
+        let data = vec![0u8; 64 << 20];
+        let err = write_within(&mut wr, &data, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stopped reading"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
