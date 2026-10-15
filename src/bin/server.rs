@@ -18,7 +18,7 @@ use redsocket_wgtcp::server::peers::PeerRegistry;
 use redsocket_wgtcp::server::run;
 use redsocket_wgtcp::wg;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct ServerConfig {
     /// Server's WireGuard private key.
     private_key: String,
@@ -55,7 +55,7 @@ struct ServerConfig {
     peers: Vec<PeerConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct PeerConfig {
     public_key: String,
     /// The inner address for this peer. Omit to derive one from the public key

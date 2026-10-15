@@ -24,7 +24,7 @@ fn default_keepalive() -> u16 {
     25
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Our WireGuard private key (base64 as produced by `wg genkey`, or hex).
@@ -69,8 +69,47 @@ fn default_prefix() -> u8 {
     24
 }
 
+/// Hand-written so a formatted configuration never prints the secrets.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("private_key", &"<redacted>")
+            .field("peer_public_key", &self.peer_public_key)
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("address", &self.address)
+            .field("prefix_len", &self.prefix_len)
+            .field("gateway", &self.gateway)
+            .field("socks_listen", &self.socks_listen)
+            .field("mtu", &self.mtu)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .finish()
+    }
+}
+
+/// The permission bits of `path` if group or others can read it; the file holds
+/// the private key and should be mode 0600.
+fn exposed_mode(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("stat config {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    Ok((mode & 0o077 != 0).then_some(mode))
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        if let Some(mode) = exposed_mode(path)? {
+            log::warn!(
+                "config {} is readable by other users (mode {mode:o}); it holds the private key",
+                path.display()
+            );
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
         let cfg: Config = toml::from_str(&text).context("parse config TOML")?;
@@ -276,6 +315,37 @@ gateway = "10.50.0.1"
         assert!(at_cap.validate().is_ok());
         let over: Config = toml::from_str(&format!("{}\nmtu = 65504\n", sample_toml())).unwrap();
         assert!(over.validate().is_err());
+    }
+
+    /// Formatting the configuration, as an embedder's error context or crash
+    /// reporter would, must not print the private or preshared key.
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let psk = crate::wg::key_to_base64(&[0x33u8; 32]);
+        let cfg: Config =
+            toml::from_str(&format!("{}\npreshared_key = \"{psk}\"\n", sample_toml())).unwrap();
+        let shown = format!("{cfg:?}");
+        assert!(
+            !shown.contains(&cfg.private_key),
+            "private key printed: {shown}"
+        );
+        assert!(!shown.contains(&psk), "preshared key printed: {shown}");
+        assert!(shown.contains(&cfg.peer_public_key), "public values stay visible");
+    }
+
+    /// The file holds the private key: a mode that lets other users read it
+    /// must be noticed, a private one must not.
+    #[test]
+    fn notices_a_config_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("redsocket-wgtcp-mode-{}", std::process::id()));
+        std::fs::write(&path, sample_toml()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(exposed_mode(&path).unwrap(), Some(0o644));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(exposed_mode(&path).unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
