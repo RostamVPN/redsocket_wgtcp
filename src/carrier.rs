@@ -25,6 +25,10 @@ use crate::wg::{Action, WgPeer};
 /// How often the WireGuard timer state machine is driven.
 const TIMER_TICK: Duration = Duration::from_millis(250);
 
+/// Random extra delay on each timer tick, so the handshake retry and the
+/// keepalive cadence are not exact multiples of a fixed period.
+const TIMER_JITTER: Duration = Duration::from_millis(333);
+
 /// How often the smoltcp stack is polled when otherwise idle. smoltcp needs
 /// regular polling for retransmission and delayed ACKs even with no I/O.
 const POLL_TICK: Duration = Duration::from_millis(10);
@@ -191,6 +195,7 @@ impl Carrier {
                 }
 
                 _ = timer.tick() => {
+                    timer.reset_after(TIMER_TICK + timer_jitter());
                     match self.peer.update_timers() {
                         Ok(Action::ToCarrier(buf)) => wire_out.push(buf),
                         Ok(_) => {}
@@ -346,6 +351,15 @@ impl Carrier {
             }
         }
     }
+}
+
+/// A uniformly random share of `TIMER_JITTER`; none if the OS random source fails.
+fn timer_jitter() -> Duration {
+    let mut b = [0u8; 2];
+    if getrandom::fill(&mut b).is_err() {
+        return Duration::ZERO;
+    }
+    TIMER_JITTER * u32::from(u16::from_le_bytes(b)) / u32::from(u16::MAX)
 }
 
 /// Write to the carrier, failing when the peer does not drain it within `deadline`.
@@ -588,6 +602,15 @@ mod tests {
             err.to_string().contains("stopped reading"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// Jitter must stay within its bound and actually vary, or the retry cadence
+    /// is a fixed fingerprint again.
+    #[test]
+    fn timer_jitter_is_bounded_and_varies() {
+        let samples: Vec<Duration> = (0..64).map(|_| timer_jitter()).collect();
+        assert!(samples.iter().all(|j| *j <= TIMER_JITTER));
+        assert!(samples.iter().any(|j| *j != samples[0]), "jitter must vary");
     }
 
     #[test]

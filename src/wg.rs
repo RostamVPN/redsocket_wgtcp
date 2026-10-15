@@ -13,6 +13,10 @@ use std::time::Duration;
 /// WireGuard's maximum transport message: 65535 inner + 32 bytes of framing.
 const MAX_WG_MSG: usize = 65535 + 32;
 
+/// Mask for the random sender index: boringtun keeps the low 8 bits as its
+/// per-handshake counter, so only the 24 bits above them are ours to pick.
+const INDEX_MASK: u32 = 0x00FF_FFFF;
+
 /// Parse a WireGuard key in either base64 (wg format) or hex.
 pub fn parse_key(s: &str) -> Result<[u8; 32]> {
     let s = s.trim();
@@ -66,14 +70,15 @@ impl WgPeer {
         let static_private = StaticSecret::from(private_key);
         let peer_static_public = PublicKey::from(peer_public_key);
 
+        let mut index = [0u8; 4];
+        getrandom::fill(&mut index).map_err(|e| anyhow!("session index: {e}"))?;
+
         let tunn = Tunn::new(
             static_private,
             peer_static_public,
             preshared_key,
             persistent_keepalive,
-
-            0,
-
+            u32::from_le_bytes(index) & INDEX_MASK,
             None,
         );
 
@@ -224,6 +229,21 @@ mod tests {
         assert_eq!(&init[1..4], &[0, 0, 0], "reserved bytes must be zero");
     }
 
+    /// The sender index in the initiation must not be a constant that a passive
+    /// observer can match: two fresh peers with the same keys must differ.
+    #[test]
+    fn sender_index_is_random_per_peer() {
+        let sk = [0x11u8; 32];
+        let peer_pk = WgPeer::public_key(&[0x22u8; 32]);
+        let index = |peer: &mut WgPeer| {
+            let init = peer.initiate_handshake().unwrap();
+            u32::from_le_bytes(init[4..8].try_into().unwrap())
+        };
+        let a = index(&mut WgPeer::new(sk, peer_pk, None, None).unwrap());
+        let b = index(&mut WgPeer::new(sk, peer_pk, None, None).unwrap());
+        assert_ne!(a, b, "sender index must be random per peer");
+    }
+
     /// Two peers configured with each other's keys must complete a handshake and
     /// then carry an inner packet. This exercises the exact call sequence the
     /// carrier uses, without any sockets.
@@ -238,7 +258,11 @@ mod tests {
         let mut b = WgPeer::new(b_sk, a_pk, None, None).unwrap();
 
         let init = a.initiate_handshake().unwrap();
-        assert_eq!(a.handshakes(), 0, "nothing is completed before the response");
+        assert_eq!(
+            a.handshakes(),
+            0,
+            "nothing is completed before the response"
+        );
         let resp = match b.decapsulate(&init).unwrap() {
             Action::ToCarrier(buf) => buf,
             _ => panic!("responder should emit a handshake response"),
@@ -268,7 +292,10 @@ mod tests {
             _ => panic!("responder should surface the inner packet"),
         }
 
-        assert!(a.decapsulate(&resp).is_err(), "a replayed response is refused");
+        assert!(
+            a.decapsulate(&resp).is_err(),
+            "a replayed response is refused"
+        );
         assert_eq!(a.handshakes(), 1, "a refused response must not count");
     }
 
