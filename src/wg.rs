@@ -184,8 +184,8 @@ mod tests {
     /// our handshake with no useful diagnostic.
     #[test]
     fn derives_public_key_from_private() {
-        let priv_b64 = "gA0mxQGcGbVjJmdzIhAbN4KixiHk4Pxd8iVzTAh5L34=";
-        let expect_pub_b64 = "xZTh+MhxH6MgML1C2Hp7aIR4vKyVMQE3xwee72XZOx0=";
+        let priv_b64 = "zQPL1Tmelil0ONXOkSkK6vfCz5zgp+VhyHUir+mGXDQ=";
+        let expect_pub_b64 = "5kTIpNvETFay4qHyWHp4X8WBOrp0Z04VFFXVHPhtxAU=";
 
         let sk = parse_key(priv_b64).unwrap();
         let pk = WgPeer::public_key(&sk);
