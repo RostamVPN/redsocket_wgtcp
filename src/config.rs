@@ -330,7 +330,10 @@ gateway = "10.50.0.1"
             "private key printed: {shown}"
         );
         assert!(!shown.contains(&psk), "preshared key printed: {shown}");
-        assert!(shown.contains(&cfg.peer_public_key), "public values stay visible");
+        assert!(
+            shown.contains(&cfg.peer_public_key),
+            "public values stay visible"
+        );
     }
 
     /// The file holds the private key: a mode that lets other users read it
