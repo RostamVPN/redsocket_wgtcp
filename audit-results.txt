@@ -12,6 +12,7 @@
 | Assessment window | 2026-10-13 – 2026-10-15 |
 | Engagement type | White-box: full source, vendored dependencies, offline build and test |
 | Lead assessor / QA reviewer | [Lead Assessor] / [QA Reviewer] |
+| Audit powered by | Claude Mythos 5.1 |
 
 Version history
 
