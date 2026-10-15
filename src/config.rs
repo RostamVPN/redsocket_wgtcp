@@ -5,8 +5,12 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+
+/// Largest inner packet the carrier can frame: a record holds a WireGuard
+/// message of at most 65535 bytes, 32 of which are transport overhead.
+const MAX_MTU: usize = 65535 - 32;
 
 fn default_socks_listen() -> String {
     "127.0.0.1:1080".to_string()
@@ -21,6 +25,7 @@ fn default_keepalive() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Our WireGuard private key (base64 as produced by `wg genkey`, or hex).
     pub private_key: String,
@@ -79,16 +84,21 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        crate::wg::parse_key(&self.private_key).context("private_key")?;
-        crate::wg::parse_key(&self.peer_public_key).context("peer_public_key")?;
+        let private = crate::wg::parse_key(&self.private_key).context("private_key")?;
+        let peer = crate::wg::parse_key(&self.peer_public_key).context("peer_public_key")?;
         if let Some(psk) = &self.preshared_key {
             crate::wg::parse_key(psk).context("preshared_key")?;
         }
-        if !self.endpoint.contains(':') {
-            return Err(anyhow!(
-                "endpoint must be host:port (the server's TCP carrier port)"
-            ));
+        if private == [0u8; 32] {
+            return Err(anyhow!("private_key is all zero"));
         }
+        if peer == [0u8; 32] {
+            return Err(anyhow!("peer_public_key is all zero"));
+        }
+        if peer == crate::wg::WgPeer::public_key(&private) {
+            return Err(anyhow!("peer_public_key is our own public key"));
+        }
+        validate_endpoint(&self.endpoint)?;
 
         if self.address.is_ipv4() != self.gateway.is_ipv4() {
             return Err(anyhow!(
@@ -112,11 +122,12 @@ impl Config {
         }
 
         let min_mtu = if self.address.is_ipv6() { 1280 } else { 576 };
-        if self.mtu < min_mtu || self.mtu > 65535 {
+        if self.mtu < min_mtu || self.mtu > MAX_MTU {
             return Err(anyhow!(
-                "mtu {} out of range ({}..65535)",
+                "mtu {} out of range ({}..={})",
                 self.mtu,
-                min_mtu
+                min_mtu,
+                MAX_MTU
             ));
         }
         Ok(())
@@ -136,6 +147,30 @@ impl Config {
             _ => Ok(None),
         }
     }
+}
+
+/// `host:port` with a usable port; the host may be a name, an IPv4 literal or
+/// a bracketed IPv6 literal.
+fn validate_endpoint(endpoint: &str) -> Result<()> {
+    let port = match endpoint.parse::<SocketAddr>() {
+        Ok(addr) => addr.port(),
+        Err(_) => {
+            let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+                anyhow!("endpoint must be host:port (the server's TCP carrier port)")
+            })?;
+            if host.is_empty() || host.contains(':') {
+                return Err(anyhow!(
+                    "endpoint host {host:?} must be a name, an IPv4 literal or a bracketed IPv6 literal"
+                ));
+            }
+            port.parse::<u16>()
+                .map_err(|_| anyhow!("endpoint port {port:?} must be 1..=65535"))?
+        }
+    };
+    if port == 0 {
+        return Err(anyhow!("endpoint port must be 1..=65535"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -174,6 +209,73 @@ gateway = "10.50.0.1"
         let bad = sample_toml().replace("203.0.113.109:51820", "203.0.113.109");
         let cfg: Config = toml::from_str(&bad).unwrap();
         assert!(cfg.validate().is_err(), "endpoint without port must fail");
+    }
+
+    /// A misspelled key must not be dropped silently: `preshared_key` typed
+    /// wrong would otherwise run the tunnel without the PSK the operator meant.
+    #[test]
+    fn rejects_unknown_fields() {
+        let typo = format!(
+            "{}\npreshared_kye = \"{}\"\n",
+            sample_toml(),
+            crate::wg::key_to_base64(&[0x33u8; 32])
+        );
+        assert!(toml::from_str::<Config>(&typo).is_err());
+    }
+
+    #[test]
+    fn validates_the_endpoint_shape() {
+        let with = |endpoint: &str| -> Config {
+            toml::from_str(&sample_toml().replace("203.0.113.109:51820", endpoint)).unwrap()
+        };
+        for bad in [
+            "::1",
+            ":",
+            "a:b",
+            "203.0.113.20:99999",
+            "203.0.113.20:0",
+            "[::1]",
+            "203.0.113.20:51820:x",
+        ] {
+            assert!(with(bad).validate().is_err(), "{bad:?} must be rejected");
+        }
+        for good in [
+            "[2001:db8::1]:51820",
+            "vpn.example.com:443",
+            "203.0.113.20:51820",
+        ] {
+            assert!(with(good).validate().is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    /// Keys that no generator produces are configuration mistakes, not identities.
+    #[test]
+    fn rejects_degenerate_keys() {
+        let own_private = crate::wg::key_to_base64(&[0x11u8; 32]);
+        let own_public = crate::wg::key_to_base64(&crate::wg::WgPeer::public_key(&[0x11u8; 32]));
+        let peer = crate::wg::key_to_base64(&[0x22u8; 32]);
+        let zero = crate::wg::key_to_base64(&[0u8; 32]);
+        for (what, text) in [
+            (
+                "all-zero private key",
+                sample_toml().replace(&own_private, &zero),
+            ),
+            ("all-zero peer key", sample_toml().replace(&peer, &zero)),
+            ("own key as peer", sample_toml().replace(&peer, &own_public)),
+        ] {
+            let cfg: Config = toml::from_str(&text).unwrap();
+            assert!(cfg.validate().is_err(), "{what} must be rejected");
+        }
+    }
+
+    /// The carrier cannot frame an inner packet above 65503 bytes; a larger MTU
+    /// would silently drop every full-size packet.
+    #[test]
+    fn caps_mtu_at_what_the_carrier_can_frame() {
+        let at_cap: Config = toml::from_str(&format!("{}\nmtu = 65503\n", sample_toml())).unwrap();
+        assert!(at_cap.validate().is_ok());
+        let over: Config = toml::from_str(&format!("{}\nmtu = 65504\n", sample_toml())).unwrap();
+        assert!(over.validate().is_err());
     }
 
     #[test]
