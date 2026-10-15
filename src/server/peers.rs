@@ -40,8 +40,7 @@ impl Peer {
     /// Human-readable identity for logs. Never logs key material beyond the public
     /// key prefix, which is not secret.
     pub fn label(&self) -> String {
-        let b64 = crate::wg::key_to_base64(&self.public_key);
-        format!("{}…", &b64[..8.min(b64.len())])
+        crate::wg::key_label(&self.public_key)
     }
 
     /// Adopt a carrier as this peer's current path.

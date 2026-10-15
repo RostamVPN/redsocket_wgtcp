@@ -95,7 +95,7 @@ async fn handle(
             Some(a) => (a, *p),
             None => {
                 reply(&mut sock, REP_HOST_UNREACHABLE).await?;
-                return Err(anyhow!("cannot resolve {name}"));
+                return Err(anyhow!("host name did not resolve"));
             }
         },
     };
@@ -127,7 +127,6 @@ async fn handle(
     };
 
     reply(&mut sock, REP_SUCCESS).await?;
-    log::debug!("tunneling to {addr}:{port}");
 
     relay(sock, handles).await
 }

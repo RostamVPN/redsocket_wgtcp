@@ -86,13 +86,9 @@ async fn run(config_path: PathBuf, socks_override: Option<String>) -> Result<()>
 
     let private_key = cfg.private_key_bytes()?;
     log::info!(
-        "our public key: {}",
-        wg::key_to_base64(&WgPeer::public_key(&private_key))
-    );
-    log::info!(
-        "peer {} via TCP carrier {}",
-        wg::key_to_base64(&cfg.peer_public_key_bytes()?),
-        cfg.endpoint
+        "our key {} to peer {}",
+        wg::key_label(&WgPeer::public_key(&private_key)),
+        wg::key_label(&cfg.peer_public_key_bytes()?)
     );
 
     let (_tx, rx) = tokio::sync::watch::channel(false);

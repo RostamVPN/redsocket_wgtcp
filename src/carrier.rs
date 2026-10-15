@@ -107,7 +107,7 @@ impl Carrier {
         loop {
             match self.connect_carrier().await {
                 Ok(sock) => {
-                    log::info!("carrier established to {}", self.endpoint);
+                    log::info!("carrier established");
                     backoff = BACKOFF_MIN;
                     if let Err(e) = self.serve(sock).await {
                         log::warn!("carrier lost: {e:#}");
@@ -127,10 +127,11 @@ impl Carrier {
     }
 
     async fn connect_carrier(&self) -> Result<TcpStream> {
+        log::debug!("dialing {}", self.endpoint);
         let sock = tokio::time::timeout(Duration::from_secs(10), dial(&self.endpoint))
             .await
             .map_err(|_| anyhow!("connect timed out"))?
-            .with_context(|| format!("connect to {}", self.endpoint))?;
+            .context("carrier connect")?;
 
         sock.set_nodelay(true).ok();
         Ok(sock)
@@ -396,7 +397,7 @@ async fn dial(endpoint: &str) -> Result<TcpStream> {
     let addr = tokio::net::lookup_host(endpoint)
         .await?
         .next()
-        .ok_or_else(|| anyhow!("could not resolve {endpoint}"))?;
+        .ok_or_else(|| anyhow!("endpoint did not resolve"))?;
 
     let std_sock = tokio::task::spawn_blocking(move || -> std::io::Result<std::net::TcpStream> {
         let domain = if addr.is_ipv4() {

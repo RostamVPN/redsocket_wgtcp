@@ -39,6 +39,12 @@ pub fn key_to_base64(key: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(key)
 }
 
+/// The first eight characters of a key's base64 form, for logs: enough to tell
+/// peers apart without writing a durable identifier.
+pub fn key_label(key: &[u8; 32]) -> String {
+    format!("{}…", &key_to_base64(key)[..8])
+}
+
 /// What the caller must do after feeding the tunnel some input.
 pub enum Action {
     /// Nothing to do.
@@ -195,6 +201,11 @@ mod tests {
         assert_eq!(parse_key(&hexed).unwrap(), raw);
 
         assert_eq!(parse_key(&format!("  {b64}\n")).unwrap(), raw);
+    }
+
+    #[test]
+    fn labels_keys_by_prefix_only() {
+        assert_eq!(key_label(&[0x11u8; 32]), "ERERERER…");
     }
 
     #[test]
