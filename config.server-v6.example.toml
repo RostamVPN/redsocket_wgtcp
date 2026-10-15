@@ -18,4 +18,4 @@ address   = "0.0.0.0:8445"
 transport = "udp"
 
 [[peers]]
-public_key = "JrsrDrD66jNExfafQg53m/U5QEK7GzxSI1xmLRm0JWQ="
+public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY"

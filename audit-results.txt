@@ -1,0 +1,415 @@
+# RostamVPN WGTCP Transport Library Security Assessment — redsocket_wgtcp
+
+## 0. Cover Page and Document Control
+
+| Field | Value |
+|---|---|
+| Title | RostamVPN WGTCP Transport Library Security Assessment — redsocket_wgtcp |
+| Prepared by | Red Team Ltd (Internet Mastering & Company, Inc., DBA Red Team Ltd.) |
+| Prepared for | [Rostam / client legal entity] |
+| Classification | CONFIDENTIAL — [Rostam / client legal entity] / Red Team Ltd. Public disclosure: yes — every item marked [REDACT-FOR-PUBLIC] must be removed before publication. |
+| Report version / date | 1.0 / 2026-10-14 |
+| Assessment window | 2026-10-13 – 2026-10-15 |
+| Engagement type | White-box: full source, vendored dependencies, offline build and test |
+| Lead assessor / QA reviewer | [Lead Assessor] / [QA Reviewer] |
+
+Version history
+
+| Version | Date | Author | Change |
+|---|---|---|---|
+| 1.0 | 2026-10-14 | [Lead Assessor] | Initial issue for QA review |
+| 1.1 | [pending] | [QA Reviewer] | QA sign-off and public-redaction pass |
+
+Distribution: [Rostam / client legal entity] engineering and legal; Red Team Ltd engagement team. A redacted edition may be published at the client's discretion.
+
+Disclaimer. This assessment was time-boxed to the window above and limited to the source tree described in section 2. It is a point-in-time review; code, dependencies and the censorship environment change. Red Team Ltd does not warrant the absence of vulnerabilities, and findings marked SUSPECTED were not verified dynamically. Nothing in this report constitutes legal advice.
+
+## 1. Executive Summary
+
+`redsocket_wgtcp` is the userspace WireGuard-over-TCP client library behind RostamVPN's WGTCP transport: boringtun for the Noise IK handshake and AEAD, smoltcp for an in-process TCP/IP stack, a loopback SOCKS5 front-end, and a TCP "record" carrier that frames WireGuard messages with an 8-byte header. Red Team Ltd reviewed every source file, ran the test suite (84 tests, all passing, offline) and a dependency audit, and re-verified the four WGTCP leads from the 2026-10-14 private-tree audit against this tree.
+
+Overall posture. The cryptographic core is sound and the integration fails closed: the server's static key is pinned by Noise IK, keys come from the OS CSPRNG, a pre-shared key is supported, the record parser is bounds-checked against kernel golden vectors, there is no `unsafe` code, and when the carrier drops the library has no path by which application traffic can leave the host unencrypted. The dominant risk is not confidentiality but survivability under censorship: the carrier is a plaintext framing protocol with constant first bytes, fixed message sizes and fixed timers, so a national DPI operator can identify and block every WGTCP user from the first packet. Two integration issues compound this: the exported "connected" signal is raised on TCP accept before any handshake, and SOCKS5 domain targets are resolved by the host resolver outside the tunnel.
+
+Findings: 10 — 1 High, 2 Medium, 4 Low, 3 Informational. RVPN-WG-010 (Informational) was remediated in the tree during the window and verified on re-check; 9 findings remain open.
+
+Top three issues
+1. RVPN-WG-001 (High) — the carrier is fingerprintable from its first 12 bytes; the header checksum is a public function of the length and provides no protection.
+2. RVPN-WG-002 (Medium) — `carrier_is_up()` is true as soon as TCP connects, ~90 s of every retry cycle against a middlebox that accepts and discards, with no handshake ever completed.
+3. RVPN-WG-003 (Medium) — hostnames given to the SOCKS5 front (the README's documented usage) are resolved in plaintext on the local network before entering the tunnel.
+
+Headline recommendation. Do not enable WGTCP in a censored region until the record stream is wrapped in an obfuscation layer (or the header is replaced by a keyed, padded framing mirrored in the kernel module); gate "connected" on handshake completion; and resolve names inside the tunnel. The remaining items are hygiene that can ship with the next release.
+
+## 2. Scope, Methodology, and Limitations
+
+Target (from Cargo.toml, README.md, config.example.toml)
+
+- Crate `redsocket-wgtcp` 0.1.0, Rust edition 2024, Apache-2.0 (Cargo.toml:1-5). Binaries `redsocket-wgtcp` (client CLI: `run`, `genkey`, `pubkey`) and `redsocket-wgtcp-server`; library `redsocket_wgtcp` (Cargo.toml:26-36); example `examples/genkey.rs`.
+- Key dependencies: boringtun 0.7.1, smoltcp 0.13.1, tokio 1.53.1, x25519-dalek 2.0.1, chacha20poly1305 0.10.1, blake2 0.10.6, getrandom 0.4.3, rand 0.10.2, toml 1.1.4, socket2 0.6.5 (Cargo.lock). 172 lockfile entries, 171 vendored under `vendor/` (.cargo/config.toml:4-8).
+- Identification: git commit `b6ef3ab` (`b6ef3ab92cf2c3305b714dc3b84efc8d7a20d503`), the initial public commit on branch `main` of https://github.com/RostamVPN/redsocket_wgtcp. At the start of the window the tree was a snapshot without `.git`; the commit was created during the window, and this report is added in a follow-up commit. Truncated SHA-256 of in-scope files in the working tree at that HEAD: Cargo.toml 27656cbc6d02f81a; Cargo.lock e020d0f5127a1b96; README.md 8d355751a9be062c; config.example.toml cb624d1a09aeb4d0; config.server-v6.example.toml e8f80ef3d2559b3d (after the RVPN-WG-010 key replacement); src/lib.rs 686b65652de2617e; src/main.rs fcee5d70bf0096d6; src/carrier.rs f863c95fe7803b76; src/config.rs ccf2f3c2f55f4bb4 (e578852db1ada2a3 before the RVPN-WG-010 address change); src/netstack.rs 02bd850513f571cf; src/record.rs 07c5c7f81718d5e3; src/socks5.rs c532802fab02202b; src/wg.rs e27df39a62feac05; src/server/run.rs eddcfb9cee7b89f9; src/server/engine.rs 6c4e76ebf67fcf0f.
+- Reviewed in full: `src/*.rs` (2,487 lines), `src/server/*.rs` (1,498), `src/bin/server.rs` (276), `examples/genkey.rs`, `.cargo/config.toml`, `.gitignore`, the three example configs and README.md. Reviewed in part: `tests/` (benchmark and proof scripts only — headers read and the files swept for addresses, hostnames and secrets; there are no Rust integration tests outside `#[cfg(test)]` modules) and, under `vendor/`, the cited sections of boringtun (`noise/mod.rs`, `timers.rs`, `handshake.rs`, `rate_limiter.rs`), smoltcp (`socket/tcp.rs`) and x25519-dalek (`x25519.rs`).
+- Tools: manual review; `cargo audit 0.22.2 --no-fetch` against the local RustSec database (1,329 advisories); `cargo test --offline` (82 library + 2 server-binary tests = 84 passed, 0 failed, 0 ignored); a short script to derive record-header bytes from the published checksum formula. No network traffic was generated and no live host was contacted.
+- Standards mapping: the engagement template's OWASP MASVS v2 / MASTG references were replaced by OWASP ASVS v4.0.3 and CWE, because the target is a transport library rather than a mobile application. CVSS 3.1 vectors are given for every finding; threat-model calibration (section 3) governs the assigned severity.
+- Assumptions: the embedding applications supply the configuration (peer key, endpoint, addresses) through their own channel; the server is a stock WGTCP kernel module or the in-tree userspace server; the library runs on a host whose resolver and routing are controlled by the embedder.
+
+Out of scope / not assessed
+- The C ABI and JNI in the sibling `wgtcp-android` crate; the Android and iOS applications; the unsigned-profile issue from the private-tree audit (§4.2 there) belongs to the apps and is only referenced here.
+- The provisioning backend, the exit server (`redsocket_http`), and the kernel WGTCP module's server behaviour (not in this tree).
+- Live packet capture and DPI-classifier testing (Appendix C gives the plan). Record sizes in RVPN-WG-001 are derived from code and golden vectors, not observed on a wire.
+
+Leads from the private-tree audit (2026-10-14, section 4), re-verified here
+
+| Lead | Then | Now | Result |
+|---|---|---|---|
+| Carrier fingerprint (HIGH) | record.rs:66-85, carrier.rs:150-154 | record.rs:26-34, 37-56, 78-111; carrier.rs:134-137 | Confirmed, RVPN-WG-001 |
+| Unsigned profile (MEDIUM) | WgtcpProvisioner.kt | n/a | Out of scope here (apps); noted in area 3 |
+| "connected" on TCP accept (MEDIUM) | carrier.rs:112 | carrier.rs:100 (set) vs :134 (handshake) | Confirmed, RVPN-WG-002 |
+| DNS leak by design (LOW) | socks5.rs:175-198 | socks5.rs:121-127, 165-181 | Confirmed, rated MEDIUM for the library, RVPN-WG-003 |
+| Yanked chacha20 0.10.1 (LOW) | Cargo.lock | Cargo.lock:230-233 via rand 0.10.2 (:961-969) | Still present, RVPN-WG-007 |
+
+"Removed for publication" claims (README.md:247-251): GPL test oracle — absent (the only occurrence of "GPL" is that README line); bench binary — absent (Cargo.toml declares two bins, no benches); license headers — present on every source and script file; vendoring — confirmed; infrastructure addresses — one routable literal remained in a test fixture at the start of the window and was replaced with an RFC 5737 address during it, and the example public key was replaced with a placeholder (RVPN-WG-010, remediated and verified on re-check).
+
+### 2.1 Attack surface and assessment by area
+
+Area 1 — Tunnel and leak integrity of the transport
+- Egress paths that exist: (a) the carrier TCP socket to `endpoint` (carrier.rs:346-377), carrying WireGuard ciphertext in plaintext records; (b) host-resolver DNS for SOCKS5 ATYP 0x03 targets (socks5.rs:170); (c) host-resolver DNS for `endpoint` when it is a hostname (carrier.rs:348, :351). Nothing else: a failed tunnel connect returns `REP_HOST_UNREACHABLE` (socks5.rs:141-144); there is no direct-connect fallback anywhere.
+- Guarantees: inner traffic only enters the tunnel via explicit SOCKS5 CONNECT (README.md:31-32); smoltcp emits only what the application wrote; the stack is single-family per config (lib.rs:37-44); a v6 target on a v4 tunnel fails at `connect` because the interface has no address of that family (smoltcp `ConnectError::Unaddressable`, vendor/smoltcp/src/socket/tcp.rs:1030-1031, surfaced as `REP_HOST_UNREACHABLE` via carrier.rs:218-223 and socks5.rs:141-144) — no path bypasses the tunnel.
+- Carrier loss: `serve()` returns an error (carrier.rs:152-154, 182, 209); `CARRIER_UP` is cleared (:105); open streams are kept and their smoltcp sockets time out after 30 s (netstack.rs:182); new requests wait in a 128-slot channel (lib.rs:57); reconnect backs off 0.5 s doubling to 30 s (carrier.rs:31-32, 114-116) and forces a fresh initiation (wg.rs:94). boringtun clears an expired handshake on re-initiation (vendor/boringtun/src/noise/mod.rs:442-444), so a 90 s blackhole does not strand the client. Fail-closed.
+- Keepalives: WireGuard persistent keepalive 25 s default (config.rs:19-21, config.example.toml:16); smoltcp per-socket keepalive 15 s (netstack.rs:183); boringtun KEEPALIVE_TIMEOUT 10 s. These are a fingerprint (area 4), not a leak.
+- Checkpoint: findings RVPN-WG-002, -003; open: none.
+
+Area 2 — Cryptography and key management
+- Keys: `getrandom::fill` → `StaticSecret` (lib.rs:84-86); the CLI `genkey` uses OS-seeded `rand::rng()` with explicit clamping (main.rs:60-64). Peer pinning: `Tunn::new(static_private, peer_static_public, psk, keepalive, 0, None)` (wg.rs:66-75); Noise IK binds the responder's static key, so an impersonator needs the server's private key. PSK optional (config.rs:31-33), passed through (lib.rs:28, wg.rs:69). The carrier checksum (record.rs:26-34) is not a MAC and the README says so (README.md:61-62); integrity rests entirely on WireGuard's Poly1305 tag. boringtun 0.7.1 with no RustSec advisory. Replay: TAI64N check (vendor/boringtun/src/noise/handshake.rs:542-547) and the data-counter window in boringtun.
+- Checkpoint: findings RVPN-WG-006 (storage/zeroization), -007 (keygen dependency); open: none.
+
+Area 3 — Configuration and carrier
+- Keys (config.rs:23-61, config.example.toml): `private_key`, `peer_public_key`, `preshared_key` (opt.), `endpoint` (`host:port`, validated only for a colon, config.rs:87-91), `address`, `gateway`, `prefix_len` (default 24), `socks_listen` (default 127.0.0.1:1080), `mtu` (default 1380, range-checked :114-121), `persistent_keepalive` (default 25). Supply: a TOML file for the CLI (`Config::load`, :68-74) or an in-memory `Config` for embedders (`run_tunnel`, lib.rs:22). There is no signature, versioning or provenance at this layer: the library pins whatever key it is given, so pinning is exactly as strong as the embedder's supply channel (the apps' unsigned-profile finding, out of scope).
+- Downgrade: none available within the library — no transport negotiation, no UDP or plaintext mode (README.md:128-133), PSK cannot be stripped by the peer, `--socks` is the only CLI override (main.rs:36-38). A hostname `endpoint` adds a DNS dependency (RVPN-WG-003).
+- Checkpoint: findings RVPN-WG-003 (endpoint resolution), -006, -009; open: D-1.
+
+Area 4 — Network fingerprintability and active-probing resistance (central)
+- Passive: every carrier connection begins with the same 12 bytes and continues with fixed sizes and timers; the full byte table and DPI narrative are in RVPN-WG-001.
+- Active probing: the client exposes nothing to the network (SOCKS5 on loopback only). The in-tree server accepts any TCP connection, silently absorbs garbage through the resync parser, replies only to a valid initiation from a registered key, and never closes (src/server/run.rs:76-119, engine.rs:70-100) — WireGuard's silence property, but on TCP, where an open port that never speaks is itself a tell. The kernel-module server was not assessed.
+- Checkpoint: finding RVPN-WG-001; open: D-2, D-3.
+
+Area 5 — Data handling
+- The library writes no files. stderr logging via env_logger with `RUST_LOG` override (main.rs:48, bin/server.rs:97). Private keys are never logged; public keys, the endpoint and (at debug) destinations are (RVPN-WG-005). `.gitignore:4-5` guards `/config.toml` and `/*.local.toml` only (RVPN-WG-006).
+- Checkpoint: findings RVPN-WG-005, -006, -010.
+
+Area 6 — Platform interaction
+- Listener: SOCKS5 bound to `socks_listen`, no authentication, no bind-address policy (RVPN-WG-004). Socket-protection hook for VpnService.protect installed once and invoked before every carrier connect (carrier.rs:337-377; test :405-433). The `wgtcp-android` C ABI is out of scope and not assessed.
+- Checkpoint: finding RVPN-WG-004.
+
+Area 7 — Memory safety
+- No `unsafe` in `src/`. Record parser: all indices guarded (record.rs:79-81, 97-104, 164-166, 206-209); 30 kernel golden vectors (:232-263). Buffers: 64 KiB carrier read buffer (carrier.rs:139), 65,567-byte boringtun scratch (wg.rs:14, :79), 256 KiB + 256 KiB per smoltcp socket (netstack.rs:17-18). Panics in non-test code: `expect`/`panic!` in `NetStack::new` (netstack.rs:138, 146, 152, 154) reachable only through an unvalidated in-memory `Config` (RVPN-WG-009); `getrandom` failure (lib.rs:85); server-side `Mutex::lock().unwrap()` (engine.rs:127, 172, 186; peers.rs) which turns a poisoned lock into a crash. No `[profile]` section, so the default `panic = "unwind"` applies to release.
+- Checkpoint: findings RVPN-WG-008, -009.
+
+Area 8 — Resilience
+- Open-source circumvention tool: no anti-tamper expected. Reproducibility: vendored sources with lockfile checksums and `--remap-path-prefix` for `/Users` and `/home` (.cargo/config.toml:2, :11) — resolves the embedded-home-path finding of the private-tree audit. No `rust-toolchain.toml`; no `strip`/`lto` settings (defaults). Reconnect and expiry handling verified (area 1).
+- Checkpoint: no findings; noted in RVPN-WG-007 (toolchain pin).
+
+Area 9 — Dependencies
+- `cargo audit --no-fetch`: 0 vulnerabilities, 1 warning (chacha20 0.10.1 yanked). Inventory in Appendix B. tokio is pulled with `features = ["full"]` (Cargo.toml:23), larger than the library needs.
+- Checkpoint: finding RVPN-WG-007.
+
+## 3. Severity Methodology
+
+Impact tiers calibrated to the threat model: Critical — deanonymization of a user, or application traffic leaving the device unprotected while the embedder shows "connected" (outcomes A, B); High — the transport is identifiable and blockable at national scale, or a remote compromise of the client (C, D); Medium — misreported tunnel state, local abuse by a co-resident process, destination metadata exposure with preconditions; Low — hygiene and defence-in-depth. Likelihood: High — passive, no key, no preconditions; Medium — requires a network position, a local foothold or a specific configuration; Low — several preconditions.
+
+| Impact \ Likelihood | High | Medium | Low |
+|---|---|---|---|
+| Critical | Critical | High | Medium |
+| High | High | Medium | Low |
+| Medium | Medium | Low | Low |
+| Low | Low | Low / Info | Info |
+
+A CVSS 3.1 vector is reported for every finding for comparability; fingerprintability and misreported state map poorly onto CVSS, so where the two disagree the matrix above governs and the finding says so. Status is CONFIRMED only where the behaviour was traced in code at the cited lines.
+
+## 4. Findings Summary Table
+
+| ID | Title | Severity | Platform | Component | Status |
+|---|---|---|---|---|---|
+| RVPN-WG-001 | Carrier identifiable from the first packet: plaintext header, fixed sizes, fixed cadence | High | All (library) | record.rs, carrier.rs, wg.rs | Confirmed |
+| RVPN-WG-002 | `carrier_is_up()` true on TCP accept, before any handshake | Medium | All (library) | carrier.rs | Confirmed |
+| RVPN-WG-003 | SOCKS5 domain targets and the endpoint name resolved by the host resolver outside the tunnel | Medium | All (library/CLI) | socks5.rs, carrier.rs | Confirmed |
+| RVPN-WG-004 | Unauthenticated SOCKS5 front, no connection cap, 512 KiB eager buffers per stream | Low | All (library/CLI) | socks5.rs, netstack.rs | Confirmed |
+| RVPN-WG-005 | Destinations, hostnames, endpoint and peer identity written to the log | Low | All (library/CLI) | socks5.rs, carrier.rs, main.rs | Confirmed |
+| RVPN-WG-006 | Private key in a plaintext file with no permission check; not zeroized in memory | Low | CLI / desktop | config.rs, lib.rs, main.rs | Confirmed |
+| RVPN-WG-007 | Yanked `chacha20 0.10.1` via `rand`, used only for `genkey`; no toolchain pin | Low | Build | Cargo.toml, Cargo.lock, main.rs | Confirmed |
+| RVPN-WG-008 | Record parser re-copies and re-scans its whole buffer on every call | Info | All (library) | record.rs | Confirmed |
+| RVPN-WG-009 | `run_tunnel` trusts an unvalidated in-memory `Config`; family mismatch panics | Info | Embedders | lib.rs, netstack.rs | Confirmed |
+| RVPN-WG-010 | Routable IPv4 literal in a test fixture and example peer public key, contrary to "addresses removed" | Info | Repository | config.rs, config.server-v6.example.toml | Remediated |
+
+## 5. Detailed Findings
+
+### RVPN-WG-001 — Carrier identifiable from the first packet: plaintext header, fixed sizes, fixed cadence
+- Severity: High. Impact High (outcome C: a national DPI operator can identify and block every WGTCP user and enumerate the user base) × Likelihood High (passive, keyless, matches at TCP payload offset 0). CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:H (8.1).
+- Status: CONFIRMED. Byte values were derived from the published formula and cross-checked against the kernel golden vectors in record.rs:232-263; on-wire sizes should be confirmed by the capture in Appendix C.
+- Location: src/record.rs:26-34 (`header_checksum`), :37-56 (`encode`), :78-111 (`parse_header`); src/carrier.rs:134-137 (initiation is the first write on every connection); src/wg.rs:91-100; src/config.rs:19-21 and config.example.toml:16 (25 s keepalive); src/netstack.rs:14 (inner MTU 1380 → 1420-byte data records), :183 (15 s per-socket keepalive). Private-tree audit cited record.rs:66-85 and carrier.rs:150-154.
+- Description: Each WireGuard message is prefixed by `len(be32) | type(u8)=0 | flags(u8) | checksum(be16)` where `checksum = rotl16((len>>16) ^ (len&0xFFFF) ^ (flags<<8|type), 5) ^ 0xA5A5` — a keyless, documented function of the length (README.md:61-66). The WireGuard message that follows is itself unencrypted in its type byte, three reserved zeros, indices, 64-bit counter and `mac2`. There is no TLS, padding, random prefix, length randomization or cover traffic, and sizes and timers are those of WireGuard plus a constant 8.
+- Evidence:
+  ```rust
+  // record.rs:26-34
+  fn header_checksum(total_len: u32, ty: u8, flags: u8) -> u16 {
+      let mut ck: u16 = 0;
+      ck ^= ((total_len >> 16) & 0xFFFF) as u16;
+      ck ^= (total_len & 0xFFFF) as u16;
+      ck ^= ((flags as u16) << 8) | (ty as u16);
+      ck = ck.rotate_left(5);
+      ck ^= 0xA5A5;
+      ck
+  }
+  // carrier.rs:134-137
+  let init = self.peer.initiate_handshake()?;
+  let mut out = Vec::new();
+  record::encode(&init, &mut out)?;
+  wr.write_all(&out).await.context("write handshake")?;
+  ```
+  What a DPI operator sees on every connection (bytes 0–11 of the TCP payload; WireGuard sizes from vendor/boringtun/src/noise/mod.rs:82-85):
+
+  | Record | Total bytes | Bytes 0–11 (hex) | Basis |
+  |---|---|---|---|
+  | Client's first bytes: handshake initiation (WG type 1, 148 B) | 156 | `00 00 00 9c 00 00 b6 25 01 00 00 00` | formula |
+  | Server's first bytes: handshake response (WG type 2, 92 B) | 100 | `00 00 00 64 00 00 a9 25 02 00 00 00` | golden vector (100,0,0,43301) |
+  | Cookie reply (WG type 3, 64 B) | 72 | `00 00 00 48 00 00 ac a5 03 00 00 00` | formula |
+  | Idle keepalive, every 25 s (WG type 4, empty) | 40 | `00 00 00 28 00 00 a0 a5 04 00 00 00` | golden vector (40,0,0,41125) |
+  | Full-size data record (inner 1380 B) | 1420 | `00 00 05 8c 00 00 14 25 04 00 00 00` | golden vector (1420,0,0,5157) |
+  | Per-stream inner TCP keepalive, every 15 s (40-B IPv4 segment) | ~80 | `00 00 00 50 00 00 af a5 04 00 00 00` | derived; confirm by pcap |
+
+  Further signature material: when the server is silent the 156-byte initiation is resent every REKEY_TIMEOUT = 5 s for REKEY_ATTEMPT_TIME = 90 s (vendor/boringtun/src/noise/timers.rs:21-22, :217-234); `mac2` is all-zero on first contact; data records carry a constant receiver index and a little-endian counter that starts at 0 and increments in clear; a rekey pair (156 + 100 bytes) recurs every 120 s of activity (timers.rs:19). The destination port is operator-chosen (51820 in config.example.toml:8), but using 443 does not help because the payload is not a TLS ClientHello.
+- Impact: A single rule such as `tcp payload starts with 00 00 00 9c 00 00 b6 25 01 00 00 00` blocks the service with no false positives, and logging it enumerates users. The checksum gives no protection. This is the condition the private-tree audit rated HIGH and advised against enabling in a censored region; it holds unchanged in this tree.
+- Reproduction: `nc -l 51820 | xxd | head -2` as the endpoint, then `redsocket-wgtcp run --config config.toml`; or `tcpdump -i any -X port 51820` on a real session; compare with the table. `cargo test record::` reproduces the checksum values.
+- Recommendation: Short term, keep WGTCP disabled for censored paths. Medium term, wrap the record stream in an obfuscation layer with a plausible cover (TLS 1.3 with a uTLS browser fingerprint and random padding, or a keyed framing in the Shadowsocks-2022/obfs4 family with length and timing randomization). If the bespoke carrier must remain, replace the plaintext header: derive a per-connection key from the Noise static-static DH or the PSK, encrypt the length field (AEAD/SIV header as in Shadowsocks-2022), pad records to random lengths, jitter keepalives, and precede the initiation with a random-length preamble. Any header change must be mirrored in the kernel module (`kernel/socket.h`), which is why the wrapper is the pragmatic path.
+- References: CWE-200, CWE-203, CWE-319; OWASP ASVS v4 V1.9.1, V9.1.1; WireGuard whitepaper §5.4 (silence, cookies); RFC 8446 §5.4 (record padding as prior art).
+
+### RVPN-WG-002 — `carrier_is_up()` true on TCP accept, before any handshake
+- Severity: Medium. Impact Medium (misreported state; outcome B's precondition, though no traffic escapes within this library) × Likelihood High (accept-then-discard is standard DPI behaviour; a revoked key produces the same silence). CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L (6.5).
+- Status: CONFIRMED.
+- Location: src/carrier.rs:97-100 (flag set), :131-137 (handshake written later, never awaited), :105 (cleared on loss), :329-335 (`carrier_is_up`); src/wg.rs:151-153 (`time_since_last_handshake`, the correct signal). Private-tree audit cited carrier.rs:112 and wg.rs:181.
+- Description: `Carrier::run` stores `CARRIER_UP = true` as soon as `connect_carrier()` returns a connected `TcpStream`; the initiation is written afterwards inside `serve()` and its completion is never consulted. With a middlebox that completes the TCP handshake and drops payload, or with an unregistered key (the server is silent by design, engine.rs:83-86), the flag stays true until boringtun gives up: after REKEY_ATTEMPT_TIME = 90 s `update_timers` returns `ConnectionExpired` (timers.rs:217-225) → carrier.rs:182 errors → flag false → backoff 0.5–30 s → reconnect → flag true again. The exported state reads "up" for about 90 s of every cycle, indefinitely, with no byte of application traffic ever carried.
+- Evidence:
+  ```rust
+  // carrier.rs:97-105
+  match self.connect_carrier().await {
+      Ok(sock) => {
+          log::info!("carrier established to {}", self.endpoint);
+          CARRIER_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+          backoff = BACKOFF_MIN;
+          if let Err(e) = self.serve(sock).await { log::warn!("carrier lost: {e:#}"); }
+          CARRIER_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+  ```
+- Impact: An embedder that gates its UI or its transport fallback on this flag (the private-tree audit traced exactly that use) shows "connected" with a dead tunnel and never falls through to a working transport. The user believes they are protected; inside this library their requests merely time out after 30 s (netstack.rs:182).
+- Reproduction: `nc -l -p 51820 > /dev/null` as the endpoint; run the client; "carrier established" is logged at once and `carrier_is_up()` is true; after ~90 s "wireguard timers: connection expired" and a reconnect; repeat.
+- Recommendation: Define readiness as "a handshake has completed on the current carrier": set the flag when `time_since_last_handshake()` first becomes `Some` (or shrinks) after a connect, clear it on `ConnectionExpired` and on carrier loss, and export a three-state `Connecting/Up/Down` plus `handshake_age()`. Add a test in which a listener that accepts and drops must never flip the flag. Sketch:
+  ```rust
+  // in serve(), after each decapsulate/update_timers:
+  if !self.handshake_seen && self.peer.time_since_last_handshake().is_some() {
+      self.handshake_seen = true; CARRIER_UP.store(true, Relaxed);
+  }
+  ```
+- References: CWE-754, CWE-392; ASVS v4 V1.11.1 (closest control; tracked primarily by CWE).
+
+### RVPN-WG-003 — SOCKS5 domain targets and the endpoint name resolved by the host resolver outside the tunnel
+- Severity: Medium. Impact High (destination metadata to the ISP; outcome A/B family) × Likelihood Medium (requires a client that sends names — which is the README's documented usage). CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N (4.3). The private-tree audit rated the same behaviour LOW for the Android embedder, which sends IP literals; for the library and its CLI the documented path is the leaking one.
+- Status: CONFIRMED (documented as a known limitation, README.md:222-227).
+- Location: src/socks5.rs:121-127 and :165-181 (`tokio::net::lookup_host`, address choice :172-179); src/carrier.rs:347-349 (`TcpStream::connect(endpoint)`) and :351-354 (`lookup_host(endpoint)`, first address only); README.md:103 (`curl --socks5-hostname`).
+- Description: Inner UDP is not implemented, so there is no in-tunnel resolver. Every ATYP 0x03 CONNECT triggers a plaintext A/AAAA query from the host resolver on the physical network before the connection enters the tunnel; a poisoned or NXDOMAIN answer becomes `REP_HOST_UNREACHABLE`. If `endpoint` is a hostname, it is likewise resolved by the host on every reconnect.
+- Evidence:
+  ```rust
+  // socks5.rs:166-170
+  async fn resolve(host: &str, port: u16) -> Option<IpAddr> {
+      if let Ok(ip) = host.parse::<IpAddr>() { return Some(ip); }
+      let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await.ok()?.collect();
+  ```
+- Impact: While the tunnel is up and reported as such, the ISP sees a time-stamped list of the hostnames the user visits and can block or redirect by DNS alone. The server's name, if a hostname is configured, is exposed on every reconnect.
+- Reproduction: `tcpdump -ni any udp port 53` while running `curl --socks5-hostname 127.0.0.1:1080 https://example.com`; the query for `example.com` appears on the physical interface.
+- Recommendation: (1) Resolve inside the tunnel: the TCP-only stack can already carry DNS-over-TCP (RFC 7766) or DoT to a resolver reached via smoltcp; inner UDP would allow plain DNS to the gateway. (2) Until then, fail loudly: add `resolve_domains = "refuse" | "system"` defaulting to `refuse`, replying 0x08 to ATYP 0x03 so leaks cannot be silent. (3) Require `endpoint` to be an IP literal, or resolve it through the embedder's protected path. (4) Correct README.md:228-229, which still says IPv6 targets are refused although socks5.rs:105-111 forwards them (test :282-313).
+- References: CWE-200, CWE-319; ASVS v4 V9.1.1, V8.1.1; RFC 1928 §5.
+
+### RVPN-WG-004 — Unauthenticated SOCKS5 front, no connection cap, 512 KiB eager buffers per stream
+- Severity: Low. Impact Medium (local abuse, denial of service) × Likelihood Medium (needs a co-resident process; loopback is not UID-sandboxed on Android or desktops). CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:L (4.4); assessed Low per the matrix and consistent with the private-tree audit's "by design" note.
+- Status: CONFIRMED.
+- Location: src/socks5.rs:35-56 (accept loop, task per connection, no limit), :61-72 (any method list answered with NO AUTH); src/netstack.rs:17-18, :178-180 (256 KiB rx + 256 KiB tx allocated at connect); src/carrier.rs:226-227; src/config.rs:11-13 (default loopback); src/main.rs:36-38, :83-85 (`--socks` override, no loopback check).
+- Description: The listener accepts every connection, selects method 0x00 even when the client did not offer it (RFC 1928 §3 requires 0xFF), and each CONNECT allocates half a megabyte of smoltcp buffers plus two 64-slot channels before the tunnel socket is even established. Nothing bounds the count.
+- Evidence:
+  ```rust
+  // socks5.rs:72            sock.write_all(&[SOCKS_VERSION, 0x00]).await?;
+  // netstack.rs:178-179     let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF]);
+  //                         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF]);
+  ```
+- Impact: Any local process can route traffic through the user's tunnel under the user's server identity, or open a few thousand connections and exhaust the tunnel process's memory (fail-closed, but the VPN dies). An operator who binds to a non-loopback address gets an open proxy on the LAN with no warning.
+- Reproduction: `python3 -c` loop opening 4,000 SOCKS5 CONNECTs to 127.0.0.1:1080 and watching RSS; `redsocket-wgtcp run --socks 0.0.0.0:1080` and connect from another host.
+- Recommendation: Cap concurrent streams (e.g. 512, reply 0x01 beyond); allocate smoltcp buffers lazily and smaller (64 KiB is ample at 1380 MTU) or pool them; refuse non-loopback binds unless `allow_remote = true`; implement method selection per RFC 1928 and offer RFC 1929 username/password with a per-launch secret for embedders.
+- References: CWE-306, CWE-770, CWE-400; ASVS v4 V4.1.1, V11.1.4.
+
+### RVPN-WG-005 — Destinations, hostnames, endpoint and peer identity written to the log
+- Severity: Low. Impact Medium (outcome A on a seized device or captured log) × Likelihood Low (debug level must be enabled; stderr only). CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N (3.3).
+- Status: CONFIRMED.
+- Location: src/socks5.rs:152 (`tunneling to {addr}:{port}`, debug), :52 and :125 (error text includes the hostname, debug); src/carrier.rs:99, :103, :108 (endpoint at info/warn); src/main.rs:88-96 (own public key, peer public key, endpoint at info); src/lib.rs:45-55 (tunnel address); src/main.rs:48 (`RUST_LOG` honoured in release).
+- Description: Debug logging produces a time-stamped destination list; info logging records the server endpoint and both static public keys, which are durable identifiers of the user and the server. The library writes no files, but embedders and systemd capture stderr.
+- Evidence: `log::debug!("tunneling to {addr}:{port}");` (socks5.rs:152); `log::info!("peer {} via TCP carrier {}", key_to_base64(&cfg.peer_public_key_bytes()?), cfg.endpoint);` (main.rs:92-96).
+- Impact: Forensic examination of a device or log collector yields where the user went and which server identity they used.
+- Reproduction: `RUST_LOG=debug redsocket-wgtcp run --config config.toml 2> log.txt`, browse, inspect `log.txt`.
+- Recommendation: Never log destination addresses or hostnames at any level (log counts and durations instead); log keys only as an 8-character prefix as the server already does (peers.rs:42-45) and the endpoint only at debug behind an explicit opt-in; document the stderr policy for embedders.
+- References: CWE-532, CWE-359; ASVS v4 V7.1.1, V7.1.2.
+
+### RVPN-WG-006 — Private key in a plaintext file with no permission check; not zeroized in memory
+- Severity: Low. Impact High (key compromise = impersonation of the user to the server) × Likelihood Low (desktop CLI with a second local account; mobile embedders keep the key in platform storage). CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N (5.5); assessed Low per the matrix.
+- Status: CONFIRMED.
+- Location: src/config.rs:23-26 (`private_key: String` in a `Clone + Serialize` struct), :68-74 (`read_to_string`, no mode check); src/lib.rs:26, src/main.rs:87 (`[u8; 32]` copies); src/lib.rs:81-90 (secret returned as a base64 `String`); src/main.rs:67 (printed to stdout); .gitignore:4-5.
+- Description: Keys are read from a TOML file whose permissions are not checked, held in heap `String`s and stack arrays that are never zeroized, and the `Serialize` derive would re-emit the key if the struct is ever serialized. `.gitignore` protects two file names only, while three example files invite copying.
+- Evidence: `let text = std::fs::read_to_string(path)...; let cfg: Config = toml::from_str(&text)...;` (config.rs:69-71); `(b64.encode(secret.as_bytes()), b64.encode(public.as_bytes()))` (lib.rs:89).
+- Impact: A world-readable config lets another local user impersonate the user; key bytes may persist in freed memory, core dumps or swap.
+- Reproduction: `ls -l config.toml` after following the README (default umask yields 0644); `gcore` the running process and grep for the base64 key.
+- Recommendation: Refuse or warn on `mode & 0o077 != 0` as `wg-quick` does; wrap secrets in `zeroize::Zeroizing` (zeroize is already in the graph via x25519-dalek) with redacting `Debug`; drop `Serialize` from `Config` or redact the field; broaden `.gitignore` to `*.toml` with `!*.example.toml`; document that embedders must inject keys from platform storage, never files.
+- References: CWE-312, CWE-316, CWE-732; ASVS v4 V6.4.1, V6.4.2, V8.3.4.
+
+### RVPN-WG-007 — Yanked `chacha20 0.10.1` via `rand`, used only for `genkey`; no toolchain pin
+- Severity: Low. Impact Low (supply-chain hygiene; not on the tunnel's cryptographic path) × Likelihood Medium. CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N (3.7).
+- Status: CONFIRMED by `cargo audit --no-fetch` (RustSec DB 1,329 advisories): 0 vulnerabilities, 1 warning — `chacha20 0.10.1` yanked.
+- Location: Cargo.lock:961-969 (`rand 0.10.2` → `chacha20 0.10.1`), :230-233; Cargo.toml:17-18; src/main.rs:9, :60 (sole use of `rand`); src/lib.rs:85 (already uses `getrandom::fill`). boringtun uses `chacha20 0.9.1` through `chacha20poly1305 0.10.1` (Cargo.lock:219-222, :241-243). No `rust-toolchain.toml` in the tree.
+- Description: Two key-generation paths exist: `main.rs` (rand, explicit clamping) and `lib.rs` (getrandom, no clamping — valid because x25519-dalek clamps at use; `StaticSecret::from` stores raw bytes, vendor/x25519-dalek/src/x25519.rs:245-249). The only consumer of the yanked crate is the CLI's `genkey`.
+- Evidence: `rand::rng().fill_bytes(&mut key);` (main.rs:60); `dependencies = [ "chacha20 0.10.1", "getrandom 0.4.3", "rand_core 0.10.1" ]` (Cargo.lock:965-969).
+- Impact: A yanked release is one the maintainers withdrew; a clean re-resolution without the vendored copy fails or silently moves version; duplicate keygen paths invite drift.
+- Reproduction: `cargo audit --no-fetch` in the crate root.
+- Recommendation: Delete `rand`, have `main.rs` call `redsocket_wgtcp::generate_keypair()`, regenerate `Cargo.lock` and re-vendor; add `cargo audit` and `cargo deny` to CI; add `rust-toolchain.toml` for reproducible builds.
+- References: CWE-1104, CWE-1395; ASVS v4 V14.2.1, V14.2.4, V14.2.5, V14.1.1.
+
+### RVPN-WG-008 — Record parser re-copies and re-scans its whole buffer on every call (Informational)
+- Severity: Informational. Impact Low (CPU amplification only; memory bounded) × Likelihood Low (requires the trusted server or a full on-path attacker, who could simply drop the connection). CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:L (3.7).
+- Status: CONFIRMED.
+- Location: src/record.rs:154-192 (`next_message`), :160 and :195-201 (`materialize` copies the whole `VecDeque` into `scratch` on every call), :204-210 (`find_resync_offset` tests every offset), :169/:176/:184 (`drain` from the front). Memory is bounded: `parse_header` caps `total_len` at 65,543 (:102) and the no-header path keeps 7 bytes (:180-185).
+- Description: A 64 KiB read holding minimum-size 40-byte records causes ~1,600 calls, each copying up to 64 KiB (tens of MB of memcpy per read); a peer that sends a valid header then trickles one byte at a time repeats a 64 KiB copy per byte. Not a vulnerability; it is on the hot path.
+- Evidence:
+  ```rust
+  // record.rs:195-201 — called at the top of every next_message() iteration (:160)
+  fn materialize(&mut self) {
+      self.scratch.clear();
+      self.scratch.reserve(self.buf.len());
+      let (a, b) = self.buf.as_slices();
+      self.scratch.extend_from_slice(a);
+      self.scratch.extend_from_slice(b);
+  }
+  ```
+- Impact: Client CPU time grows with the square of the buffered length under adversarial record sizes; no memory growth, no crash, no leak.
+- Reproduction: Unit test: `encode` 1,600 records of 32-byte payload into one `Vec`, `push` it once, and time the `while let Some(_) = p.next_message()` loop; compare with 1,600 single-record pushes.
+- Recommendation: Parse in place (`as_slices`/`make_contiguous`), consume with a cursor and compact lazily; bound resync scanning per call.
+- References: CWE-407; ASVS v4 n/a.
+
+### RVPN-WG-009 — `run_tunnel` trusts an unvalidated in-memory `Config`; family mismatch panics (Informational)
+- Severity: Informational. Impact Low (abort of the tunnel process, fail-closed) × Likelihood Low (embedder-supplied misconfiguration; no network input reaches these paths). CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:L (2.5).
+- Status: CONFIRMED.
+- Location: src/lib.rs:22-44 (no `validate()` call); src/config.rs:67-79 (`validate` private, `validate_public` opt-in); src/netstack.rs:135-155 (`expect` ×3, `panic!`); Cargo.toml (no `[profile]`, so `panic = "unwind"`).
+- Description: The CLI validates through `Config::load` (config.rs:72), but an embedder that builds `Config` in memory and skips `validate_public()` reaches a panic in `NetStack::new` on a mixed address family. In the CLI a panic terminates the process — fail-closed, since the SOCKS5 listener and carrier share one `select!` (lib.rs:65-75); embedders must `catch_unwind`.
+- Evidence:
+  ```rust
+  // lib.rs:26-28 — keys are decoded, but cfg.validate() is never called
+  let private_key = cfg.private_key_bytes().context("private_key")?;
+  let peer_public = cfg.peer_public_key_bytes().context("peer_public_key")?;
+  // netstack.rs:154
+  (a, g) => panic!("address {a} and gateway {g} must be the same family"),
+  ```
+- Impact: The CLI process aborts (fail-closed: the SOCKS5 listener dies with the carrier); an embedder without `catch_unwind` loses its tunnel thread.
+- Reproduction: Build a `Config` with `address = 10.50.0.2` and `gateway = fd00::1` in memory and call `run_tunnel` without `validate_public()`; the unit test `mismatched_address_families_panic` (netstack.rs:443-452) demonstrates the same condition.
+- Recommendation: Call `cfg.validate()` at the top of `run_tunnel`; return `Err` from `NetStack::new` instead of panicking; consider `panic = "abort"` with a supervisor for the CLI.
+- References: CWE-248, CWE-20; ASVS v4 V5.1.3.
+
+### RVPN-WG-010 — Routable IPv4 literal in a test fixture despite "addresses removed" (Informational; remediated)
+- Severity: Informational. Impact Low (a residual identifier in a public tree) × Likelihood Low (matters only if the literal or key is or was a live asset). CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N (3.7).
+- Status: REMEDIATED (verified in tree after re-check, working tree at HEAD `b6ef3ab`): src/config.rs:150 and :174 now read `203.0.113.109:51820` (RFC 5737) and config.server-v6.example.toml:21 now reads `public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY"`; a sweep of all non-vendored files finds no remaining routable literal or base64 key. The original observation is kept below as history, with the key shown as a prefix only; the assessment team did not probe either value.
+- Location: src/config.rs:150 and :174 (`endpoint = "172.32.36.109:51820"`); config.server-v6.example.toml:21 (a syntactically valid peer public key). README.md:247-250 states infrastructure addresses were removed.
+- Description: 172.32.0.0/16 lies outside RFC 1918 (172.16.0.0/12 ends at 172.31.255.255) and outside the RFC 5737 documentation ranges, so the literal is globally routable. The example public key is not secret but, if it belongs to a production peer, it is a durable identifier. All other literals in the tree are loopback, RFC 1918, ULA or RFC 5737.
+- Evidence:
+  ```toml
+  # src/config.rs:150 (test fixture; repeated at :174)
+  endpoint = "172.32.36.109:51820"
+  # config.server-v6.example.toml:21
+  public_key = "JrsrDrD6…"   # 44-character base64 value, truncated here
+  ```
+  Re-check: config.rs:150 `endpoint = "203.0.113.109:51820"` and :174 updated to match; config.server-v6.example.toml:21 `public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY"`.
+- Impact (original assessment): if live, the address was a durable pointer to infrastructure and the key a durable peer identity, both in a published repository; otherwise none. No residual impact after remediation.
+- Verification: closed — both files re-read at the cited lines after the change; the sweep in the Status line guards against further residues.
+- Recommendation: Done for both items. Add a pre-publication grep for non-documentation literals and base64 keys to CI so the condition cannot recur.
+- References: CWE-200; ASVS v4 V14.3.2.
+
+## 6. Positive Observations
+
+- Peer authentication: Noise IK via boringtun with the server's static key pinned at construction (wg.rs:63-75); impersonation requires the server's private key. Optional PSK is wired end-to-end (config.rs:31-33, lib.rs:28, wg.rs:69).
+- Randomness: `getrandom::fill` for keys (lib.rs:85); the test asserts distinctness, correct derivation and a non-zero point (lib.rs:96-114).
+- Fail-closed carrier: the only egress is the carrier socket; no direct-connect fallback; bounded reconnect backoff (carrier.rs:31-32, 114-116); a fresh initiation on every reconnect (wg.rs:94); boringtun clears expired handshakes on re-initiation (vendor/boringtun/src/noise/mod.rs:442-444), so a long blackhole does not strand the client.
+- Socket protection: the VpnService.protect hook is installed once (second install refused) and invoked before every connect (carrier.rs:337-377; test :405-433).
+- Parser robustness: every index guarded, 30 kernel golden vectors, byte-at-a-time reassembly, fragment-header stripping and resync tests (record.rs:213-444); no `unsafe` in `src/`.
+- Server hardening (in-tree): inner-source anti-spoofing for both families (engine.rs:156-167), anonymous initiator identification without cleartext identity (engine.rs:70-100), self-as-peer refusal (peers.rs:131-133), key prefixes only in logs (peers.rs:42-45).
+- Reproducibility and publication hygiene: vendored sources with lockfile checksums (.cargo/config.toml:4-8), `--remap-path-prefix` and `-ffile-prefix-map` for `/Users` and `/home` (.cargo/config.toml:2, :11), SPDX headers on every source and script file, the GPL oracle and live addresses removed as stated (one residual literal, RVPN-WG-010).
+- Honest documentation: the DNS and TCP-over-TCP limitations are stated plainly (README.md:220-235).
+
+## 7. Appendix A — OWASP ASVS v4.0.3 control checklist (adapted; MASVS/MASTG not applicable)
+
+| Control | Result | Note |
+|---|---|---|
+| V1.9.1 Encrypted communication between components | Partial | Carrier payload encrypted; framing and DNS in clear (RVPN-WG-001, -003) |
+| V1.11.1 Business-logic flows documented and consistent | Partial | Readiness flag contradicts actual state (RVPN-WG-002) |
+| V5.1.3 Input validated with positive allow-lists | Pass | Config, SOCKS5 and record parsers validate; in-memory path opt-in (RVPN-WG-009) |
+| V6.2.1 Approved algorithms only | Pass | X25519, ChaCha20-Poly1305, BLAKE2s via boringtun |
+| V6.2.3 / V6.3.1 CSPRNG for secrets | Pass | getrandom; OS-seeded rand for CLI genkey (RVPN-WG-007 for the dependency) |
+| V6.2.6 Nonces never reused | Pass | boringtun counter management |
+| V6.4.1 / V6.4.2 Secret storage and handling | Partial | Plaintext file, no zeroization (RVPN-WG-006) |
+| V7.1.1 Credentials never logged | Pass | Private keys never logged |
+| V7.1.2 Sensitive data never logged | Fail | Destinations at debug, keys and endpoint at info (RVPN-WG-005) |
+| V8.1.1 / V8.3.4 Sensitive data protected in transit and identified | Partial | Hostnames leave in plaintext DNS (RVPN-WG-003) |
+| V9.1.1 Encrypted channel for all client connectivity | Partial | Tunnel yes; DNS no |
+| V9.1.2 / V9.2.1 Strong algorithms; server identity verified | Pass | Noise IK with pinned static key |
+| V10.3.3 Dependencies from trusted sources, integrity checked | Pass | Vendored, lockfile checksums |
+| V11.1.4 Anti-automation / resource limits | Fail | No stream cap (RVPN-WG-004) |
+| V14.1.1 Reproducible build | Partial | Vendored and path-remapped; no toolchain pin (RVPN-WG-007) |
+| V14.2.1 / V14.2.4 / V14.2.5 Components current, trusted, inventoried | Partial | 0 advisories, 1 yanked crate; lockfile serves as SBOM |
+| V14.3.2 No debug or development material exposed | Pass | Routable literal and example public key both replaced during the window (RVPN-WG-010 remediated) |
+| V2 Authentication, V3 Session, V12 Files, V13 API | Not assessed | No user authentication or file/API surface in a transport library |
+
+## 8. Appendix B — Dependency inventory
+
+Direct dependencies (Cargo.toml:7-25) with resolved versions from Cargo.lock; `cargo audit --no-fetch` (2026-10-14, 1,329 advisories): 0 vulnerabilities, 1 warning.
+
+| Crate | Version | Role | Advisory |
+|---|---|---|---|
+| boringtun | 0.7.1 | WireGuard (Noise IK, AEAD, timers) | none |
+| smoltcp | 0.13.1 | In-process TCP/IP | none |
+| tokio | 1.53.1 (`full`) | Async runtime | none; feature set larger than needed |
+| x25519-dalek / curve25519-dalek | 2.0.1 / 4.1.3 | Key agreement (via boringtun) | none |
+| chacha20poly1305 / chacha20 | 0.10.1 / 0.9.1 | AEAD (via boringtun) | none |
+| chacha20 | 0.10.1 | via rand 0.10.2 | yanked (RVPN-WG-007) |
+| rand / rand_core | 0.10.2 / 0.10.1, 0.6.4 | CLI genkey only | none |
+| getrandom | 0.4.3, 0.2.17 | OS randomness | none |
+| ring | 0.17.14 | via boringtun | none |
+| blake2 | 0.10.6 | Server v6 address derivation | none |
+| hmac | 0.12.1 | via boringtun | none |
+| toml / serde | 1.1.4 / 1.0.229 | Config parsing | none |
+| clap / env_logger / log / anyhow / thiserror | 4.6.6 / 0.11.11 / 0.4.33 / 1.0.104 / 2.0.20 | CLI, logging, errors | none |
+| base64 / hex | 0.23.1 (+0.22.1 transitive) / 0.4.3 | Key encoding | none |
+| socket2 | 0.6.5 | Protected carrier dial | none |
+| tun | 0.8 | Server TUN device only | none |
+| futures | 0.3.33 | Server task join | none |
+| zeroize | (transitive) | Available but unused by this crate | — |
+
+All 172 lockfile entries carry crates.io checksums and are vendored under `vendor/` (171 directories). No `git =` or `path =` dependencies. No dependency phones home.
+
+## 9. Appendix C — Recommended dynamic test plan
+
+1. Wire fingerprint: Linux host, `tcpdump -i <uplink> -w wgtcp.pcap port 51820`; connect, idle 60 s, transfer 10 MB, idle 60 s. Expected: first 12 client bytes `00 00 00 9c 00 00 b6 25 01 00 00 00`, server `00 00 00 64 00 00 a9 25 02 00 00 00`, 40-byte records at 25 s, 1420-byte data records, ~80-byte records at 15 s per idle stream. Feed the pcap to Zeek/Suricata with a 12-byte content rule; expect 100% hit rate, 0 false positives on a control corpus.
+2. Retry cadence: endpoint = `iptables -A INPUT -p tcp --dport 51820 -j DROP` after the TCP handshake (or `nc -l` discarding); expect 156-byte records every 5 s for 90 s, then reconnect; log `carrier_is_up()` via a 10-line embedder — expect true during the 90 s (RVPN-WG-002).
+3. Active probing of the in-tree server: `nc` to the port, send 1 KiB random bytes, then a replayed captured initiation, then nothing for 10 min; expect no reply and no close in all three cases; compare with the kernel-module server.
+4. DNS leak: `tcpdump -ni any udp port 53 or tcp port 53` while `curl --socks5-hostname 127.0.0.1:1080 https://example.com`; expect the query on the physical interface (RVPN-WG-003); repeat with `--socks5` (literal) and expect none.
+5. Carrier loss and recovery: drop the path for 120 s mid-transfer; expect no packets to the destination outside the tunnel, stream EOF at ~30 s, reconnect with backoff ≤ 30 s and a fresh handshake; verify with the same pcap.
+6. Local abuse: open 4,000 SOCKS5 CONNECTs from a second user account; record RSS and whether the tunnel process is killed (RVPN-WG-004); attempt `--socks 0.0.0.0:1080` and connect from another host.
+7. Logging: `RUST_LOG=debug` session; grep stderr for destination IPs, hostnames and base64 keys (RVPN-WG-005).
+8. Memory: `gcore` the client after `run`; grep for the base64 private key (RVPN-WG-006).
+
+## 10. Appendix D — Open questions for the development team
+
+- D-1: Is the kernel module's `wg_tcp_encap_header` frozen, or can a keyed/padded header be rolled out to both ends together?
+- D-2: Which upstream wrapper (TLS/uTLS, Shadowsocks-2022, obfs4-style) is planned for WGTCP, and will the record layer sit inside it unchanged?
+- D-3: Does the kernel-module server behave like the userspace one under probing (accept, silence, never close)?
+- D-4: Do all current embedders send IP literals to the SOCKS5 front, or do any use ATYP 0x03?
+- D-5: Which readiness signal do the Android and iOS embedders consume today — `carrier_is_up()` only, or also `time_since_last_handshake()`?
+- D-6: Closed — the address at config.rs:150 and the example public key at config.server-v6.example.toml:21 were both replaced during the window (RVPN-WG-010).
+- D-7: Is there a reason `rand` must remain, given `generate_keypair()` already uses `getrandom`?
+- D-8: Can a `rust-toolchain.toml` and `cargo audit`/`cargo deny` be added to the release pipeline?

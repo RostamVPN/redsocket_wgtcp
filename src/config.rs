@@ -147,7 +147,7 @@ mod tests {
             r#"
 private_key = "{}"
 peer_public_key = "{}"
-endpoint = "172.32.36.109:51820"
+endpoint = "203.0.113.109:51820"
 address = "10.50.0.2"
 gateway = "10.50.0.1"
 "#,
@@ -171,7 +171,7 @@ gateway = "10.50.0.1"
 
     #[test]
     fn rejects_endpoint_without_port() {
-        let bad = sample_toml().replace("172.32.36.109:51820", "172.32.36.109");
+        let bad = sample_toml().replace("203.0.113.109:51820", "203.0.113.109");
         let cfg: Config = toml::from_str(&bad).unwrap();
         assert!(cfg.validate().is_err(), "endpoint without port must fail");
     }
