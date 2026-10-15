@@ -3,9 +3,10 @@
 
 //! Server runtime: binds every configured listener and pumps packets.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -17,6 +18,14 @@ use crate::record::{self, RecordParser};
 /// Bounded per-carrier queue; applies backpressure instead of unbounded growth
 /// when a client's link is slower than its traffic.
 const CARRIER_QUEUE: usize = 256;
+
+/// A carrier that sends nothing for this long is dropped; a live client sends a
+/// handshake or keepalive well within three REJECT_AFTER_TIMEs.
+const CARRIER_IDLE: Duration = Duration::from_secs(540);
+
+/// Pause after a failed accept, for example on descriptor exhaustion, instead
+/// of spinning.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Where to send packets destined for a given peer.
 pub type ReplySender = mpsc::Sender<Vec<u8>>;
@@ -59,6 +68,7 @@ async fn serve_tcp(
             Ok(v) => v,
             Err(e) => {
                 log::warn!("{addr}/tcp accept failed: {e}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
                 continue;
             }
         };
@@ -66,7 +76,7 @@ async fn serve_tcp(
         let engine = engine.clone();
         let tun_tx = tun_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_carrier(engine, sock, remote, tun_tx).await {
+            if let Err(e) = handle_tcp_carrier(engine, sock, remote, tun_tx, CARRIER_IDLE).await {
                 log::debug!("carrier {remote} closed: {e:#}");
             }
         });
@@ -78,6 +88,7 @@ async fn handle_tcp_carrier(
     sock: TcpStream,
     remote: SocketAddr,
     tun_tx: mpsc::Sender<Vec<u8>>,
+    idle: Duration,
 ) -> Result<()> {
     let (mut rd, mut wr) = sock.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CARRIER_QUEUE);
@@ -103,7 +114,10 @@ async fn handle_tcp_carrier(
     let mut buf = vec![0u8; 65536];
 
     loop {
-        let n = rd.read(&mut buf).await.context("carrier read")?;
+        let n = tokio::time::timeout(idle, rd.read(&mut buf))
+            .await
+            .map_err(|_| anyhow!("carrier idle for {idle:?}"))?
+            .context("carrier read")?;
         if n == 0 {
             break;
         }
@@ -220,5 +234,32 @@ pub async fn route_to_peer(engine: &Arc<Engine>, packet: Vec<u8>) {
         }
         Ok(None) => {}
         Err(e) => log::debug!("egress to {}: {e:#}", peer.label()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::peers::PeerRegistry;
+
+    /// A carrier that connects and never sends anything must not be kept for
+    /// ever with its buffer and parser.
+    #[tokio::test]
+    async fn idle_carrier_is_dropped() {
+        let engine = Arc::new(Engine::new(Arc::new(PeerRegistry::new([0x11u8; 32]))));
+        let (tun_tx, _tun_rx) = mpsc::channel(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (sock, remote) = listener.accept().await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_tcp_carrier(engine, sock, remote, tun_tx, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the idle carrier must be dropped within the budget");
+        assert!(result.unwrap_err().to_string().contains("idle"));
     }
 }

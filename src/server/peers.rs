@@ -9,7 +9,13 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Lock without propagating poisoning: the guarded state is plain data, and a
+/// panic in another task must not turn every later caller into a second panic.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// One configured peer and its WireGuard state machine.
 pub struct Peer {
@@ -51,7 +57,7 @@ impl Peer {
         tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         generation: u64,
     ) {
-        let mut slot = self.carrier.lock().unwrap();
+        let mut slot = lock(&self.carrier);
         if let Some(existing) = slot.as_ref() {
             if existing.generation > generation {
                 return;
@@ -70,7 +76,7 @@ impl Peer {
     }
 
     pub fn carrier(&self) -> Option<CarrierPath> {
-        self.carrier.lock().unwrap().clone()
+        lock(&self.carrier).clone()
     }
 }
 
@@ -111,7 +117,7 @@ impl PeerRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.by_pubkey.lock().unwrap().len()
+        lock(&self.by_pubkey).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -158,26 +164,20 @@ impl PeerRegistry {
 
         self.remove_peer(&public_key);
 
-        self.by_pubkey
-            .lock()
-            .unwrap()
-            .insert(public_key, peer.clone());
-        self.by_index.lock().unwrap().insert(index, peer.clone());
-        self.by_allowed_ip
-            .lock()
-            .unwrap()
-            .insert(allowed_ip, peer.clone());
+        lock(&self.by_pubkey).insert(public_key, peer.clone());
+        lock(&self.by_index).insert(index, peer.clone());
+        lock(&self.by_allowed_ip).insert(allowed_ip, peer.clone());
 
         Ok(peer)
     }
 
     /// Remove a peer and every index pointing at it.
     pub fn remove_peer(&self, public_key: &[u8; 32]) -> bool {
-        let existing = self.by_pubkey.lock().unwrap().remove(public_key);
+        let existing = lock(&self.by_pubkey).remove(public_key);
         match existing {
             Some(peer) => {
-                self.by_index.lock().unwrap().remove(&peer.index);
-                self.by_allowed_ip.lock().unwrap().remove(&peer.allowed_ip);
+                lock(&self.by_index).remove(&peer.index);
+                lock(&self.by_allowed_ip).remove(&peer.allowed_ip);
                 true
             }
             None => false,
@@ -185,27 +185,23 @@ impl PeerRegistry {
     }
 
     pub fn by_pubkey(&self, public_key: &[u8; 32]) -> Option<Arc<Peer>> {
-        self.by_pubkey.lock().unwrap().get(public_key).cloned()
+        lock(&self.by_pubkey).get(public_key).cloned()
     }
 
     /// Look up by the wire's `receiver_idx` (the raw 32-bit session index).
     pub fn by_receiver_idx(&self, receiver_idx: u32) -> Option<Arc<Peer>> {
-        self.by_index
-            .lock()
-            .unwrap()
-            .get(&(receiver_idx >> 8))
-            .cloned()
+        lock(&self.by_index).get(&(receiver_idx >> 8)).cloned()
     }
 
     /// Route an inner destination address to the peer that owns it.
     pub fn by_inner_ip(&self, ip: IpAddr) -> Option<Arc<Peer>> {
-        self.by_allowed_ip.lock().unwrap().get(&ip).cloned()
+        lock(&self.by_allowed_ip).get(&ip).cloned()
     }
 
     /// All peers, for timer ticks and stats. Clones the Arc list rather than
     /// holding the lock across per-peer work.
     pub fn snapshot(&self) -> Vec<Arc<Peer>> {
-        self.by_pubkey.lock().unwrap().values().cloned().collect()
+        lock(&self.by_pubkey).values().cloned().collect()
     }
 }
 
@@ -231,6 +227,21 @@ mod tests {
 
         assert_eq!(reg.by_receiver_idx(peer.index << 8).unwrap().public_key, pk);
         assert_eq!(reg.by_inner_ip(ip).unwrap().public_key, pk);
+    }
+
+    /// A task that panics while holding a peer lock must not turn every later
+    /// lock into a second panic.
+    #[test]
+    fn locking_survives_poisoning() {
+        let m = Arc::new(Mutex::new(7u32));
+        let poisoner = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert_eq!(*lock(&m), 7);
     }
 
     #[test]

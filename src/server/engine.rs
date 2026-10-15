@@ -10,7 +10,7 @@ use boringtun::x25519::PublicKey;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::peers::{Peer, PeerRegistry};
+use super::peers::{Peer, PeerRegistry, lock};
 
 pub use super::addressing::{inner_destination, inner_source};
 
@@ -124,7 +124,7 @@ impl Engine {
         };
 
         let mut scratch = vec![0u8; 65535 + 32];
-        let mut tunn = peer.tunn.lock().unwrap();
+        let mut tunn = lock(&peer.tunn);
 
         match tunn.decapsulate(None, datagram, &mut scratch) {
             TunnResult::Done => Ok(Ingress::Done),
@@ -169,7 +169,7 @@ impl Engine {
     /// Encrypt an inner IP packet for the peer that owns its destination.
     pub fn egress(&self, peer: &Peer, inner: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut scratch = vec![0u8; 65535 + 32];
-        let mut tunn = peer.tunn.lock().unwrap();
+        let mut tunn = lock(&peer.tunn);
         match tunn.encapsulate(inner, &mut scratch) {
             TunnResult::Done => Ok(None),
             TunnResult::WriteToNetwork(buf) => Ok(Some(buf.to_vec())),
@@ -183,7 +183,7 @@ impl Engine {
         let peers = self.registry.snapshot();
         let mut scratch = vec![0u8; 65535 + 32];
         for peer in peers {
-            let mut tunn = peer.tunn.lock().unwrap();
+            let mut tunn = lock(&peer.tunn);
             if let TunnResult::WriteToNetwork(buf) = tunn.update_timers(&mut scratch) {
                 let msg = buf.to_vec();
                 drop(tunn);
