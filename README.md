@@ -225,8 +225,12 @@ Read these numbers with the caveats:
   through. This is not an independent setting: closing the leak requires
   adding inner UDP support first. Until then, resolve to literal IPs upstream
   if query visibility matters.
-- **IPv4 inside the tunnel.** IPv6 SOCKS5 targets are refused with
-  `ATYP not supported` rather than silently hanging.
+- **One address family inside the tunnel.** IPv4 and IPv6 SOCKS5 targets are
+  both accepted, but the inner stack has the family of `address` only; a
+  target of the other family is refused with `host unreachable`.
+- **Unauthenticated local proxy.** Any process on the host can use the SOCKS5
+  listener, so keep it on loopback. Concurrent streams are capped at 512 and
+  a client that does not finish its request within 10 s is dropped.
 - **TCP only.** No UDP associate; `CONNECT` is the only supported command.
 - **TCP-over-TCP.** The carrier is TCP and so is most tunneled traffic.
   Under loss this compounds retransmission and can stall throughput; see

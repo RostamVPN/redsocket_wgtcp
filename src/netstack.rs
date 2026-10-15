@@ -173,8 +173,18 @@ impl NetStack {
         port
     }
 
-    /// Open a tunneled TCP connection to `dest`.
+    /// Open a tunneled TCP connection to `dest`. A destination of the other
+    /// address family is refused here; smoltcp would otherwise accept it and
+    /// leave the socket in SYN-SENT until it times out.
     pub fn connect(&mut self, dest: IpEndpoint) -> Result<SocketHandle, tcp::ConnectError> {
+        if !self
+            .iface
+            .ip_addrs()
+            .iter()
+            .any(|a| a.address().version() == dest.addr.version())
+        {
+            return Err(tcp::ConnectError::Unaddressable);
+        }
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
@@ -371,6 +381,20 @@ mod tests {
         assert!(small < large, "smaller MTU must advertise a smaller MSS");
 
         assert_eq!(small, (1000 - 40) as u16);
+    }
+
+    /// The inner stack has one address family; a target of the other family is
+    /// refused at connect, which the SOCKS5 front reports as unreachable.
+    #[test]
+    fn refuses_targets_of_the_other_family() {
+        let mut stack = test_stack();
+        let dest: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(
+            stack
+                .connect(IpEndpoint::new(to_smoltcp(dest), 443))
+                .is_err(),
+            "a v6 target on a v4 tunnel cannot be addressed"
+        );
     }
 
     /// A v6 tunnel must emit routable IPv6 packets. This is the client-side half of
