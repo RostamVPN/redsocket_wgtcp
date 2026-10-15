@@ -121,8 +121,6 @@ pub enum RecordError {
 /// Streaming record parser over a TCP byte stream.
 pub struct RecordParser {
     buf: VecDeque<u8>,
-    /// Contiguous scratch so we can hand out slices without copying twice.
-    scratch: Vec<u8>,
     resyncs: u64,
 }
 
@@ -136,7 +134,6 @@ impl RecordParser {
     pub fn new() -> Self {
         Self {
             buf: VecDeque::new(),
-            scratch: Vec::new(),
             resyncs: 0,
         }
     }
@@ -150,64 +147,51 @@ impl RecordParser {
         self.buf.extend(data.iter().copied());
     }
 
-    /// Pull the next complete WireGuard message, if one is fully buffered.
+    /// Pull the next complete WireGuard message, if one is fully buffered. The
+    /// buffer is parsed in place; only the payload is copied out.
     pub fn next_message(&mut self) -> Option<Vec<u8>> {
         loop {
             if self.buf.len() < ENCAP_HDR_LEN {
                 return None;
             }
 
-            self.materialize();
-
-            match parse_header(&self.scratch) {
+            let buf = self.buf.make_contiguous();
+            match parse_header(buf) {
                 Some(hdr) => {
-                    if self.scratch.len() < hdr.total_len {
+                    if buf.len() < hdr.total_len {
                         return None;
                     }
-                    let start = hdr.header_len();
-                    let payload = self.scratch[start..hdr.total_len].to_vec();
+                    let payload = buf[hdr.header_len()..hdr.total_len].to_vec();
                     self.buf.drain(..hdr.total_len);
                     return Some(payload);
                 }
-                None => {
-                    match self.find_resync_offset() {
-                        Some(off) => {
-                            self.resyncs += 1;
-                            self.buf.drain(..off);
-                            continue;
-                        }
-                        None => {
-                            let keep = ENCAP_HDR_LEN - 1;
-                            if self.buf.len() > keep {
-                                self.resyncs += 1;
-                                let drop = self.buf.len() - keep;
-                                self.buf.drain(..drop);
-                            }
-                            return None;
-                        }
+                None => match find_resync_offset(buf) {
+                    Some(off) => {
+                        self.resyncs += 1;
+                        self.buf.drain(..off);
                     }
-                }
+                    None => {
+                        let keep = ENCAP_HDR_LEN - 1;
+                        if self.buf.len() > keep {
+                            self.resyncs += 1;
+                            let drop = self.buf.len() - keep;
+                            self.buf.drain(..drop);
+                        }
+                        return None;
+                    }
+                },
             }
         }
     }
+}
 
-    /// Copy the ring buffer into contiguous scratch for slice-based parsing.
-    fn materialize(&mut self) {
-        self.scratch.clear();
-        self.scratch.reserve(self.buf.len());
-        let (a, b) = self.buf.as_slices();
-        self.scratch.extend_from_slice(a);
-        self.scratch.extend_from_slice(b);
+/// Scan for the next byte offset that starts a structurally valid header.
+fn find_resync_offset(buf: &[u8]) -> Option<usize> {
+    let n = buf.len();
+    if n < ENCAP_HDR_LEN {
+        return None;
     }
-
-    /// Scan for the next byte offset that starts a structurally valid header.
-    fn find_resync_offset(&self) -> Option<usize> {
-        let n = self.scratch.len();
-        if n < ENCAP_HDR_LEN {
-            return None;
-        }
-        (1..=(n - ENCAP_HDR_LEN)).find(|&off| parse_header(&self.scratch[off..]).is_some())
-    }
+    (1..=(n - ENCAP_HDR_LEN)).find(|&off| parse_header(&buf[off..]).is_some())
 }
 
 #[cfg(test)]
@@ -325,10 +309,11 @@ mod tests {
     }
 
     /// The whole point of the streaming parser: TCP may deliver a record one byte
-    /// at a time and must not yield anything until it is complete.
+    /// at a time and must not yield anything until it is complete, even for a
+    /// maximum-size record, without copying the buffer on every byte.
     #[test]
     fn reassembles_byte_by_byte() {
-        let payload = vec![0x11u8; 200];
+        let payload = vec![0x11u8; WG_MAX_PACKET_SIZE - ENCAP_HDR_LEN];
         let mut wire = Vec::new();
         encode(&payload, &mut wire).unwrap();
 
@@ -340,6 +325,43 @@ mod tests {
             }
         }
         assert_eq!(p.next_message().unwrap(), payload);
+    }
+
+    /// Mutated and truncated records must never panic the parser, and clean
+    /// records after them must be delivered again once it has resynchronised.
+    #[test]
+    fn survives_mutated_input() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let payload = vec![0x42u8; 64];
+        let mut clean = Vec::new();
+        encode(&payload, &mut clean).unwrap();
+
+        let mut p = RecordParser::new();
+        for _ in 0..2_000 {
+            let mut wire = clean.clone();
+            for _ in 0..(next() % 4) {
+                let at = (next() as usize) % wire.len();
+                wire[at] ^= (next() & 0xFF) as u8;
+            }
+            wire.truncate(wire.len() - (next() as usize % 8));
+            p.push(&wire);
+            while p.next_message().is_some() {}
+        }
+
+        for _ in 0..1_100 {
+            p.push(&clean);
+        }
+        let mut last = None;
+        while let Some(m) = p.next_message() {
+            last = Some(m);
+        }
+        assert_eq!(last.as_deref(), Some(payload.as_slice()));
     }
 
     #[test]
