@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
-use boringtun::noise::{Tunn, TunnResult};
+use boringtun::noise::{Packet, Tunn, TunnResult};
 
 use boringtun::x25519::{PublicKey, StaticSecret};
 use std::time::Duration;
@@ -51,6 +51,9 @@ pub struct WgPeer {
     /// Scratch for boringtun output. Sized for the largest WireGuard message so
     /// encapsulate/decapsulate can never truncate.
     scratch: Vec<u8>,
+    /// Handshakes completed as initiator, so the carrier can tell a fresh one
+    /// from a session left over from an earlier connection.
+    handshakes: u64,
 }
 
 impl WgPeer {
@@ -77,6 +80,7 @@ impl WgPeer {
         Ok(Self {
             tunn,
             scratch: vec![0u8; MAX_WG_MSG],
+            handshakes: 0,
         })
     }
 
@@ -113,13 +117,27 @@ impl WgPeer {
 
     /// Feed a WireGuard message received from the carrier.
     pub fn decapsulate(&mut self, datagram: &[u8]) -> Result<Action> {
-        match self.tunn.decapsulate(None, datagram, &mut self.scratch) {
-            TunnResult::Done => Ok(Action::None),
-            TunnResult::WriteToNetwork(buf) => Ok(Action::ToCarrier(buf.to_vec())),
-            TunnResult::WriteToTunnelV4(buf, _) => Ok(Action::ToStack(buf.to_vec())),
-            TunnResult::WriteToTunnelV6(buf, _) => Ok(Action::ToStack(buf.to_vec())),
-            TunnResult::Err(e) => Err(anyhow!("decapsulate: {e:?}")),
+        let is_response = matches!(
+            Tunn::parse_incoming_packet(datagram),
+            Ok(Packet::HandshakeResponse(_))
+        );
+        let action = match self.tunn.decapsulate(None, datagram, &mut self.scratch) {
+            TunnResult::Done => Action::None,
+            TunnResult::WriteToNetwork(buf) => Action::ToCarrier(buf.to_vec()),
+            TunnResult::WriteToTunnelV4(buf, _) | TunnResult::WriteToTunnelV6(buf, _) => {
+                Action::ToStack(buf.to_vec())
+            }
+            TunnResult::Err(e) => return Err(anyhow!("decapsulate: {e:?}")),
+        };
+        if is_response {
+            self.handshakes += 1;
         }
+        Ok(action)
+    }
+
+    /// Handshakes completed as initiator; only a valid response counts.
+    pub fn handshakes(&self) -> u64 {
+        self.handshakes
     }
 
     pub fn drain_queued(&mut self, out: &mut Vec<Vec<u8>>) -> Result<()> {
@@ -220,6 +238,7 @@ mod tests {
         let mut b = WgPeer::new(b_sk, a_pk, None, None).unwrap();
 
         let init = a.initiate_handshake().unwrap();
+        assert_eq!(a.handshakes(), 0, "nothing is completed before the response");
         let resp = match b.decapsulate(&init).unwrap() {
             Action::ToCarrier(buf) => buf,
             _ => panic!("responder should emit a handshake response"),
@@ -234,6 +253,8 @@ mod tests {
             a.time_since_last_handshake().is_some(),
             "initiator should have a completed handshake"
         );
+        assert_eq!(a.handshakes(), 1, "a valid response completes a handshake");
+        assert_eq!(b.handshakes(), 0, "the responder initiated nothing");
 
         let inner = build_test_ipv4_packet();
         let wire = match a.encapsulate(&inner).unwrap() {
@@ -246,6 +267,9 @@ mod tests {
             Action::ToStack(pkt) => assert_eq!(pkt, inner, "inner packet must round-trip"),
             _ => panic!("responder should surface the inner packet"),
         }
+
+        assert!(a.decapsulate(&resp).is_err(), "a replayed response is refused");
+        assert_eq!(a.handshakes(), 1, "a refused response must not count");
     }
 
     /// Minimal well-formed IPv4 header + payload, since boringtun inspects the
