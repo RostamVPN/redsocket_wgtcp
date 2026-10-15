@@ -23,6 +23,7 @@ pub async fn run_tunnel(
     cfg: config::Config,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    cfg.validate_public()?;
     let private_key = cfg.private_key_bytes().context("private_key")?;
     let peer_public = cfg.peer_public_key_bytes().context("peer_public_key")?;
     let psk = cfg.preshared_key_bytes().context("preshared_key")?;
@@ -41,7 +42,7 @@ pub async fn run_tunnel(
         cfg.prefix_len,
         to_smoltcp(cfg.gateway),
         cfg.mtu,
-    );
+    )?;
     log::info!(
         "tunnel address {}/{} via {} ({})",
         cfg.address,
@@ -88,6 +89,35 @@ pub fn generate_keypair() -> (String, String) {
     let b64 = base64::engine::general_purpose::STANDARD;
     (b64.encode(secret.as_bytes()), b64.encode(public.as_bytes()))
 }
+#[cfg(test)]
+mod tunnel_tests {
+    use super::*;
+
+    /// An embedder builds the configuration in memory, so an invalid one must
+    /// come back as an error from run_tunnel rather than a panic in the stack.
+    #[tokio::test]
+    async fn run_tunnel_rejects_an_invalid_config() {
+        let cfg = config::Config {
+            private_key: wg::key_to_base64(&[0x11u8; 32]),
+            peer_public_key: wg::key_to_base64(&[0x22u8; 32]),
+            preshared_key: None,
+            endpoint: "203.0.113.20:51820".into(),
+            address: "10.50.0.2".parse().unwrap(),
+            prefix_len: 24,
+            gateway: "fd00:5ed0:c0de::1".parse().unwrap(),
+            socks_listen: "127.0.0.1:0".into(),
+            mtu: netstack::TUNNEL_MTU,
+            persistent_keepalive: 25,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let err = run_tunnel(cfg, rx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("same address family"),
+            "unexpected error: {err:#}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod keygen_tests {
     use super::*;

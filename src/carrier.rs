@@ -490,7 +490,8 @@ mod tests {
             24,
             to_smoltcp("10.50.0.1".parse().unwrap()),
             TUNNEL_MTU,
-        );
+        )
+        .unwrap();
         Carrier::new("unused".into(), peer, stack, connect_rx)
     }
 

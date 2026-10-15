@@ -3,6 +3,7 @@
 
 //! Userspace TCP/IP stack driving the tunnel's inner packets.
 
+use anyhow::{Result, anyhow};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -126,7 +127,20 @@ pub struct NetStack {
 
 impl NetStack {
     /// Build the stack with the tunnel's inner address and the inner MTU.
-    pub fn new(address: IpAddress, prefix_len: u8, gateway: IpAddress, mtu: usize) -> Self {
+    pub fn new(address: IpAddress, prefix_len: u8, gateway: IpAddress, mtu: usize) -> Result<Self> {
+        let max_prefix = match (address, gateway) {
+            (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) => 32,
+            (IpAddress::Ipv6(_), IpAddress::Ipv6(_)) => 128,
+            (a, g) => {
+                return Err(anyhow!(
+                    "address {a} and gateway {g} must be the same family"
+                ));
+            }
+        };
+        if prefix_len > max_prefix {
+            return Err(anyhow!("prefix_len {prefix_len} must be <= {max_prefix}"));
+        }
+
         let mut device = TunnelDevice::new(mtu);
 
         let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
@@ -138,28 +152,27 @@ impl NetStack {
                 .expect("interface address list is empty");
         });
 
-        match (address, gateway) {
-            (IpAddress::Ipv4(_), IpAddress::Ipv4(gw)) => {
+        match gateway {
+            IpAddress::Ipv4(gw) => {
                 iface
                     .routes_mut()
                     .add_default_ipv4_route(gw)
                     .expect("route table is empty");
             }
-            (IpAddress::Ipv6(_), IpAddress::Ipv6(gw)) => {
+            IpAddress::Ipv6(gw) => {
                 iface
                     .routes_mut()
                     .add_default_ipv6_route(gw)
                     .expect("route table is empty");
             }
-            (a, g) => panic!("address {a} and gateway {g} must be the same family"),
         }
 
-        Self {
+        Ok(Self {
             iface,
             device,
             sockets: SocketSet::new(Vec::new()),
             next_port: 49152,
-        }
+        })
     }
 
     /// Allocate an ephemeral source port from the dynamic range.
@@ -236,6 +249,7 @@ mod tests {
             to_smoltcp("10.50.0.1".parse().unwrap()),
             mtu,
         )
+        .unwrap()
     }
 
     fn test_stack() -> NetStack {
@@ -406,7 +420,8 @@ mod tests {
             64,
             to_smoltcp("fd00:5ed0:c0de::1".parse().unwrap()),
             TUNNEL_MTU,
-        );
+        )
+        .unwrap();
 
         let dest: std::net::IpAddr = "2606:4700:4700::1111".parse().unwrap();
         stack
@@ -441,7 +456,8 @@ mod tests {
             64,
             to_smoltcp("fd00:5ed0:c0de::1".parse().unwrap()),
             TUNNEL_MTU,
-        );
+        )
+        .unwrap();
 
         let dest: std::net::IpAddr = "2001:4860:4860::8888".parse().unwrap();
         stack
@@ -462,17 +478,16 @@ mod tests {
         assert!(matches!(dev.capabilities().checksum.icmpv6, Checksum::Both));
     }
 
-    /// Mixing families can never route, so it must fail loudly at construction
-    /// rather than silently dropping every packet.
+    /// Mixing families can never route, and a prefix longer than the address
+    /// trips an assertion inside smoltcp; both must come back as errors rather
+    /// than panics, because the embedders build this configuration in memory.
     #[test]
-    #[should_panic(expected = "same family")]
-    fn mismatched_address_families_panic() {
-        NetStack::new(
-            to_smoltcp("10.50.0.2".parse().unwrap()),
-            24,
-            to_smoltcp("fd00:5ed0:c0de::1".parse().unwrap()),
-            TUNNEL_MTU,
-        );
+    fn rejects_mixed_families_and_oversized_prefixes() {
+        let v4 = to_smoltcp("10.50.0.2".parse().unwrap());
+        let v4_gw = to_smoltcp("10.50.0.1".parse().unwrap());
+        let v6_gw = to_smoltcp("fd00:5ed0:c0de::1".parse().unwrap());
+        assert!(NetStack::new(v4, 24, v6_gw, TUNNEL_MTU).is_err());
+        assert!(NetStack::new(v4, 33, v4_gw, TUNNEL_MTU).is_err());
     }
 
     #[test]
