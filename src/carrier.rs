@@ -138,11 +138,11 @@ impl Carrier {
     }
 
     /// Drive one carrier connection until it fails. Readiness is raised by the
-    /// first handshake completed on this connection and cleared when it ends.
+    /// first handshake completed on this connection and cleared when it ends,
+    /// including when the task driving it is dropped.
     async fn serve(&mut self, sock: TcpStream) -> Result<()> {
-        let result = self.serve_connected(sock).await;
-        CARRIER_UP.store(false, Ordering::Relaxed);
-        result
+        let _readiness = Readiness;
+        self.serve_connected(sock).await
     }
 
     async fn serve_connected(&mut self, sock: TcpStream) -> Result<()> {
@@ -380,6 +380,15 @@ pub fn carrier_is_up() -> bool {
     CARRIER_UP.load(Ordering::Relaxed)
 }
 
+/// Clears the readiness flag when the carrier connection it belongs to ends.
+struct Readiness;
+
+impl Drop for Readiness {
+    fn drop(&mut self) {
+        CARRIER_UP.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Hook invoked on every outbound carrier socket before `connect()`.
 static PROTECT_HOOK: std::sync::OnceLock<fn(i32)> = std::sync::OnceLock::new();
 
@@ -447,6 +456,7 @@ mod tests {
     use super::*;
     use crate::netstack::{TUNNEL_MTU, to_smoltcp};
     use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
 
     /// The protection hook must actually run before connect, and must run on every
     /// carrier dial.
@@ -519,10 +529,42 @@ mod tests {
         }
     }
 
+    /// Start a carrier against a loopback responder; returns the serving task
+    /// and the responder task.
+    async fn serve_against_responder(
+        client_sk: [u8; 32],
+        server_sk: [u8; 32],
+    ) -> (JoinHandle<Result<()>>, JoinHandle<()>) {
+        let (connect_tx, connect_rx) = mpsc::channel(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sock = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let client_pk = WgPeer::public_key(&client_sk);
+        let responder = tokio::spawn(respond_handshake(listener, server_sk, client_pk));
+        let mut carrier = test_carrier(client_sk, WgPeer::public_key(&server_sk), connect_rx);
+        let serving = tokio::spawn(async move {
+            let _keep_connects_open = connect_tx;
+            carrier.serve(sock).await
+        });
+        (serving, responder)
+    }
+
+    async fn wait_until_up() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !carrier_is_up() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a completed handshake must raise the flag"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// An embedder reads the readiness flag to decide whether the tunnel is
     /// usable: it must start false, stay false against a peer that accepts the
     /// TCP connection but never answers the handshake, rise only once a handshake
-    /// completes, and fall when the carrier is lost.
+    /// completes, and fall when the carrier is lost or its task is dropped.
     #[tokio::test]
     async fn readiness_follows_the_handshake() {
         assert!(
@@ -531,8 +573,6 @@ mod tests {
         );
         let client_sk = [0x31u8; 32];
         let server_sk = [0x32u8; 32];
-        let client_pk = WgPeer::public_key(&client_sk);
-        let server_pk = WgPeer::public_key(&server_sk);
 
         let (_connect_tx, connect_rx) = mpsc::channel(1);
         let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -540,7 +580,7 @@ mod tests {
             .await
             .unwrap();
         let (held, _) = silent.accept().await.unwrap();
-        let mut carrier = test_carrier(client_sk, server_pk, connect_rx);
+        let mut carrier = test_carrier(client_sk, WgPeer::public_key(&server_sk), connect_rx);
         let serving = tokio::spawn(async move { carrier.serve(sock).await });
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -550,23 +590,8 @@ mod tests {
         serving.abort();
         drop(held);
 
-        let (_connect_tx, connect_rx) = mpsc::channel(1);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let sock = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let responder = tokio::spawn(respond_handshake(listener, server_sk, client_pk));
-        let mut carrier = test_carrier(client_sk, server_pk, connect_rx);
-        let serving = tokio::spawn(async move { carrier.serve(sock).await });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !carrier_is_up() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a completed handshake must raise the flag"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
+        let (serving, responder) = serve_against_responder(client_sk, server_sk).await;
+        wait_until_up().await;
         responder.abort();
         let err = serving.await.unwrap().unwrap_err();
         assert!(
@@ -574,6 +599,16 @@ mod tests {
             "unexpected carrier error: {err:#}"
         );
         assert!(!carrier_is_up(), "carrier loss must clear the flag");
+
+        let (serving, responder) = serve_against_responder(client_sk, server_sk).await;
+        wait_until_up().await;
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+        assert!(
+            !carrier_is_up(),
+            "dropping the carrier task must clear the flag"
+        );
+        responder.abort();
     }
 
     /// A peer that keeps the connection open but stops reading must not stall the
